@@ -87,6 +87,12 @@ Whisper использует отдельный Python-процесс с PyTorch
   запроса, не выводит ключи и историю.
 - `node scripts/run-electron.js scripts/test-system-audio.js` — Windows loopback probe;
   кратко запрашивает аудиопоток и освобождает его, ничего не сохраняет.
+- `<Python окружения Whisper> scripts/check-whisper-gpu.py --device cuda` —
+  реальная проверка вычислений CUDA без загрузки модели. `--smoke --model-dir <cache>`
+  проверяет существующие веса на искусственной тишине без записи и скачивания.
+- `<Python окружения Whisper> tests/whisper_worker_test.py` — тесты Python-worker.
+- `node scripts/run-electron.js scripts/check-interview-prompts.js` — три фиксированных
+  вопроса для ручной проверки промптов через настроенный OpenAI/Cloudflare API.
 
 `npm start` и `npm run dev` работают в Windows PowerShell; `clean` пока использует
 Unix-команду `rm -rf`. После установки зависимостей можно запустить
@@ -120,6 +126,12 @@ Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
   отключено скрытое reasoning; не возвращай тесту соединения лимит 64 токена.
 - Не записывай API-ключи, аудио, скриншоты и полные диалоги в новые логи.
   Не выводи содержимое пользовательского `.env` и не добавляй секреты в Git.
+- `prompts/_interview.md` задаёт общий стиль коротких естественных ответов для
+  активных профилей. Не переопределяй его требованием всегда давать длинный ответ
+  в голосовых/скриншотных обёртках. Язык кода не должен менять язык пояснений.
+- Проверяй Whisper в Python-окружении выбранного CLI. `nvidia-smi` и
+  `torch.cuda.is_available()` недостаточны для доказательства работы inference.
+  Явный `cuda` не должен скрыто переходить на CPU, в том числе в запасном CLI.
 - Для новых параметров проверяй значения по умолчанию, чтение окружения,
   сохранение настроек, UI и `env.example`. Следуй разрешению `ENV_PATH` в `main.js`;
   не создавай второй независимый путь хранения настроек.

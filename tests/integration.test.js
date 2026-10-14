@@ -39,9 +39,18 @@ test('OpenAI routing preserves skill expertise for both voice and typed question
   await llm.processTextWithSkillStream('Define retention', 'analyst', [], null, () => {});
   assert.equal(llm.provider, 'openai');
   assert.equal(llm.isInitialized, true);
-  assert.match(requests[0].systemInstruction.parts[0].text, /machine learning engineering assistant/);
+  assert.match(requests[0].systemInstruction.parts[0].text, /machine learning engineer/);
   assert.match(requests[0].systemInstruction.parts[0].text, /Go/);
-  assert.match(requests[1].systemInstruction.parts[0].text, /product, data, business and systems/);
+  assert.match(requests[1].systemInstruction.parts[0].text, /product, data, business or systems analyst/);
+  for (const request of requests) {
+    const instructions = request.systemInstruction.parts[0].text;
+    assert.match(instructions, /Live interview response style/);
+    assert.match(instructions, /2-5 short sentences/);
+    assert.doesNotMatch(instructions, /Do not truncate or shorten|Keep responses detailed|Respond ONLY in Go/);
+  }
+  const imageRequest = llm.formatImageInstruction('backend', 'go');
+  assert.match(imageRequest, /code only for a coding task/);
+  assert.equal(llm.formatUserMessage(' Что такое транзакция? ', 'backend'), 'Что такое транзакция?');
   assert.deepEqual(deltas, ['A useful answer']);
   const connection = await llm.testConnection();
   assert.equal(connection.success, true);

@@ -163,6 +163,41 @@ You can use local Whisper for offline transcription, Cloudflare Whisper without 
 
 For local Whisper, `./setup.sh` handles the full setup. It creates `.venv-whisper`, installs `openai-whisper`, points `.env` at the virtual environment, creates `.whisper-models`, and runs a quick speech test. The app reads its own PCM WAV recordings directly; ffmpeg is only needed when transcribing other audio formats through the CLI fallback.
 
+`WHISPER_DEVICE=auto` uses CUDA when the selected Python environment supports it,
+otherwise CPU. Explicit `cpu` and `cuda` settings also apply to the CLI fallback;
+CUDA failures are reported instead of silently switching to CPU. The local speech
+connection test checks device selection and an actual CUDA computation, not just
+`whisper --help`. It does not load the model or measure transcription accuracy.
+
+Run the device probe with the **same Python interpreter as your configured Whisper
+CLI**. The optional smoke check loads existing weights and transcribes synthetic
+silence; it never records your audio or downloads model weights:
+
+```powershell
+$whisperPythonPath = '<your-whisper-venv>\Scripts\python.exe'
+& $whisperPythonPath scripts/check-whisper-gpu.py --device cuda
+& $whisperPythonPath scripts/check-whisper-gpu.py --device cuda --smoke --model small --model-dir '<existing-model-cache>'
+& $whisperPythonPath tests/whisper_worker_test.py
+```
+
+On Windows, a plain Whisper installation may install CPU-only PyTorch. For Pascal
+GPUs such as GTX 1060, use a wheel that still includes Pascal support. The
+[PyTorch 2.14 support matrix](https://github.com/pytorch/pytorch/blob/main/RELEASE.md#pytorch-cuda-support-matrix)
+lists it for CUDA 12.6; CUDA 13 builds do not include it. For Python 3.13 on Windows,
+the [official CUDA 12.6 index](https://download.pytorch.org/whl/cu126/torch/)
+contains the compatible `torch==2.14.1+cu126` wheel:
+
+```powershell
+& $whisperPythonPath -m pip install 'torch==2.14.1+cu126' --index-url https://download.pytorch.org/whl/cu126
+```
+
+Interview response style is shared in `prompts/_interview.md`, with expertise and
+task-specific rules in each skill prompt. Typed, spoken, and screenshot questions
+use the same short, natural response style. Full implementations are reserved for
+coding tasks, and prompts do not invent personal experience. To manually inspect
+three fixed sample answers with saved OpenAI/Cloudflare credentials, run
+`node scripts/run-electron.js scripts/check-interview-prompts.js` (this sends real API requests).
+
 For Azure Speech, create a Speech resource in the [Azure Portal](https://portal.azure.com/), then add the key and region to `.env` with `SPEECH_PROVIDER=azure`.
 
 ## How it works

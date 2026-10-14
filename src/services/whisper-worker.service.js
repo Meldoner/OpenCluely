@@ -72,6 +72,11 @@ class WhisperWorkerService {
     }
   }
 
+  async diagnose(options = {}) {
+    if (!this.isConfigured()) throw new Error('Persistent Whisper worker is not configured');
+    return this._request({ action: 'diagnose', device: options.device || 'auto' }, 30000);
+  }
+
   _ensureProcess() {
     if (this.process && !this.process.killed) {
       return;
@@ -140,6 +145,7 @@ class WhisperWorkerService {
       pending.resolve(message);
     } else {
       const error = new Error(message.error || 'Whisper worker request failed');
+      error.code = message.code;
       error.workerTraceback = message.traceback;
       pending.reject(error);
     }

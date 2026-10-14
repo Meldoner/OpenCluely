@@ -16,6 +16,45 @@ model_dir = None
 model_device = None
 
 
+class DeviceError(RuntimeError):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def resolve_device(requested_device):
+    if requested_device not in ('auto', 'cpu', 'cuda'):
+        raise ValueError('Whisper device must be auto, cpu or cuda')
+    if requested_device == 'cuda' and not torch.cuda.is_available():
+        reason = 'a CPU-only PyTorch build' if torch.version.cuda is None else 'an unavailable CUDA device or driver'
+        raise DeviceError(f'CUDA was requested but this Python environment has {reason}. Install a compatible CUDA-enabled PyTorch build in this same environment.', 'CUDA_UNAVAILABLE')
+    return ('cuda' if torch.cuda.is_available() else 'cpu') if requested_device == 'auto' else requested_device
+
+
+def diagnose(request):
+    device = resolve_device(request.get('device') or 'auto')
+    gpu_verified = False
+    if device == 'cuda':
+        try:
+            # is_available() alone does not prove this wheel supports the GPU.
+            sample = torch.ones((16, 16), device='cuda')
+            product = sample @ sample
+            torch.cuda.synchronize()
+            if product[0, 0].item() != 16:
+                raise RuntimeError('CUDA computation produced an unexpected result')
+            gpu_verified = True
+        except RuntimeError as error:
+            raise DeviceError(f'CUDA compute check failed: {error}', 'CUDA_COMPUTE_FAILED') from error
+    return {
+        'device': device,
+        'gpu_verified': gpu_verified,
+        'torch': torch.__version__,
+        'torch_cuda': torch.version.cuda,
+        'cuda_available': torch.cuda.is_available(),
+        'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+    }
+
+
 def send(payload):
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + '\n')
     sys.stdout.flush()
@@ -36,14 +75,7 @@ def ensure_model(request):
     global model, model_name, model_dir, model_device
     requested_name = request.get('model') or 'small'
     requested_dir = request.get('model_dir') or None
-    requested_device = request.get('device') or 'auto'
-    if requested_device == 'auto':
-        requested_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    if requested_device == 'cuda' and not torch.cuda.is_available():
-        raise RuntimeError(
-            'CUDA was requested but this Python environment has no CUDA-enabled PyTorch build'
-        )
+    requested_device = resolve_device(request.get('device') or 'auto')
 
     if (
         model is None
@@ -122,52 +154,46 @@ def transcribe(request):
     }
 
 
-send({
-    'event': 'ready',
-    'pid': os.getpid(),
-    'torch': torch.__version__,
-    'cuda_available': torch.cuda.is_available(),
-    'torch_cuda': torch.version.cuda,
-    'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-})
+def main():
+    send({
+        'event': 'ready',
+        'pid': os.getpid(),
+        'torch': torch.__version__,
+        'cuda_available': torch.cuda.is_available(),
+        'torch_cuda': torch.version.cuda,
+        'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+    })
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        request_id = None
+        try:
+            request = json.loads(raw_line)
+            request_id = request.get('id')
+            action = request.get('action')
+            if action == 'diagnose':
+                send({'id': request_id, 'ok': True, **diagnose(request)})
+            elif action == 'transcribe':
+                send({'id': request_id, 'ok': True, **transcribe(request)})
+            elif action == 'warmup':
+                _, device = ensure_model(request)
+                send({'id': request_id, 'ok': True, 'warmed': True, 'device': device,
+                      'model': model_name, 'cuda_available': torch.cuda.is_available(),
+                      'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None})
+            elif action == 'unload':
+                unload_model()
+                send({'id': request_id, 'ok': True, 'unloaded': True})
+            elif action == 'shutdown':
+                unload_model()
+                send({'id': request_id, 'ok': True, 'shutdown': True})
+                break
+            else:
+                raise ValueError(f'Unsupported worker action: {action}')
+        except Exception as error:
+            send({'id': request_id, 'ok': False, 'error': str(error),
+                  'code': getattr(error, 'code', None), 'traceback': traceback.format_exc()})
 
-for raw_line in sys.stdin:
-    raw_line = raw_line.strip()
-    if not raw_line:
-        continue
 
-    request_id = None
-    try:
-        request = json.loads(raw_line)
-        request_id = request.get('id')
-        action = request.get('action')
-
-        if action == 'transcribe':
-            send({'id': request_id, 'ok': True, **transcribe(request)})
-        elif action == 'warmup':
-            _, device = ensure_model(request)
-            send({
-                'id': request_id,
-                'ok': True,
-                'warmed': True,
-                'device': device,
-                'model': model_name,
-                'cuda_available': torch.cuda.is_available(),
-                'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-            })
-        elif action == 'unload':
-            unload_model()
-            send({'id': request_id, 'ok': True, 'unloaded': True})
-        elif action == 'shutdown':
-            unload_model()
-            send({'id': request_id, 'ok': True, 'shutdown': True})
-            break
-        else:
-            raise ValueError(f'Unsupported worker action: {action}')
-    except Exception as error:
-        send({
-            'id': request_id,
-            'ok': False,
-            'error': str(error),
-            'traceback': traceback.format_exc(),
-        })
+if __name__ == '__main__':
+    main()

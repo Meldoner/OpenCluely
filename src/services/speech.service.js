@@ -1144,11 +1144,23 @@ class SpeechService extends EventEmitter {
       if (!this.whisperCommand) {
         return { success: false, message: 'Local Whisper CLI not found' };
       }
+      if (this.whisperWorker.isConfigured()) {
+        try {
+          const result = await this.whisperWorker.diagnose({ device: this._getWhisperDevice() });
+          return { ...result, success: true, message: result.device === 'cuda'
+            ? `Local Whisper CUDA compute verified: ${result.gpu} (PyTorch ${result.torch})`
+            : `Local Whisper uses CPU (PyTorch ${result.torch}). GPU inference was not verified.` };
+        } catch (error) {
+          return { success: false, code: error.code, message: error.message };
+        } finally {
+          this.whisperWorker.releaseWhenIdle();
+        }
+      }
       // Actually probe the executable to confirm it works
       const probe = spawnSync(
         this.whisperCommand.command,
         [...this.whisperCommand.baseArgs, '--help'],
-        { encoding: 'utf8', timeout: 10000 }
+        { encoding: 'utf8', timeout: 10000, windowsHide: true }
       );
       if (probe.error || probe.status !== 0) {
         const err = probe.error ? probe.error.message : `exit code ${probe.status}`;
@@ -1158,8 +1170,9 @@ class SpeechService extends EventEmitter {
         };
       }
       return {
-        success: true,
-        message: `Local Whisper CLI works: ${this.whisperCommand.command}`
+        success: this._getWhisperDevice() !== 'cuda',
+        gpu_verified: false,
+        message: 'Local Whisper CLI is available, but GPU computation could not be verified. Configure WHISPER_PYTHON with the interpreter used by this CLI.'
       };
     }
 
@@ -1357,7 +1370,9 @@ class SpeechService extends EventEmitter {
   }
 
   _getWhisperDevice() {
-    return String(process.env.WHISPER_DEVICE || 'auto').trim().toLowerCase();
+    const device = String(this._getSetting('whisperDevice') || process.env.WHISPER_DEVICE || 'auto').trim().toLowerCase();
+    if (!['auto', 'cpu', 'cuda'].includes(device)) throw new Error('Whisper device must be auto, cpu or cuda');
+    return device;
   }
 
   _getWhisperPythonPath() {
@@ -1369,11 +1384,6 @@ class SpeechService extends EventEmitter {
       if (fs.existsSync(resolvedPython)) {
         return resolvedPython;
       }
-    }
-
-    const userDataCandidate = this._getUserDataWhisperCandidate();
-    if (userDataCandidate && fs.existsSync(userDataCandidate.command)) {
-      return userDataCandidate.command;
     }
 
     if (!this.whisperCommand) {
@@ -1392,7 +1402,9 @@ class SpeechService extends EventEmitter {
 
     const pythonName = process.platform === 'win32' ? 'python.exe' : 'python';
     const siblingPython = path.join(path.dirname(command), pythonName);
-    return fs.existsSync(siblingPython) ? siblingPython : null;
+    if (fs.existsSync(siblingPython)) return siblingPython;
+    const userDataCandidate = this._getUserDataWhisperCandidate();
+    return userDataCandidate && fs.existsSync(userDataCandidate.command) ? userDataCandidate.command : null;
   }
 
   _getWhisperWorkerScriptPath() {
@@ -1786,6 +1798,7 @@ class SpeechService extends EventEmitter {
         });
         return result.text || '';
       } catch (error) {
+        if (String(error.code || '').startsWith('CUDA_')) throw error;
         logger.warn('Persistent Whisper worker failed; falling back to CLI', {
           error: error.message,
           workerTraceback: error.workerTraceback
@@ -1802,8 +1815,14 @@ class SpeechService extends EventEmitter {
       '--output_format', 'txt',
       '--output_dir', outputDir,
       '--verbose', 'False',
-      '--fp16', 'False'
+      '--fp16', this._getWhisperDevice() === 'cpu' ? 'False' : 'True',
+      '--temperature', '0',
+      '--condition_on_previous_text', 'False'
     ];
+
+    const device = this._getWhisperDevice();
+    // Whisper's CLI defaults to CUDA when available. It does not accept auto.
+    if (device !== 'auto') args.push('--device', device);
 
     const language = this._getWhisperLanguage();
     if (language && language !== 'auto' && language !== 'detect') {
@@ -1817,7 +1836,9 @@ class SpeechService extends EventEmitter {
     try {
       await new Promise((resolve, reject) => {
         const child = spawn(this.whisperCommand.command, args, {
-          stdio: ['ignore', 'pipe', 'pipe']
+          stdio: ['ignore', 'ignore', 'pipe'],
+          windowsHide: true,
+          env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
         });
 
         let stderr = '';

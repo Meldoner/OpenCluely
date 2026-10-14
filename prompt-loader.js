@@ -24,6 +24,7 @@ class PromptLoader {
     
     try {
       const files = fs.readdirSync(promptsDir);
+      const interviewStyle = fs.readFileSync(path.join(promptsDir, '_interview.md'), 'utf8').trim();
       
       for (const file of files) {
         if (file.endsWith('.md')) {
@@ -32,7 +33,7 @@ class PromptLoader {
           const filePath = path.join(promptsDir, file);
           const promptContent = fs.readFileSync(filePath, 'utf8');
           
-          this.prompts.set(skillName, promptContent);
+          this.prompts.set(skillName, `${interviewStyle}\n\n${promptContent.trim()}\n\nOutput reminder: Deliver just the short answer addressed to the interviewer. Proposed work uses conditional verbs, such as 'I would', rather than claims of work performed.`);
         }
       }
       
@@ -91,11 +92,12 @@ class PromptLoader {
       case 'dsa':
         languageInjection = `\n\n## IMPLEMENTATION LANGUAGE: ${languageUpper}
 STRICT REQUIREMENTS:
-- Respond ONLY in ${languageTitle}. Do not include any snippets or alternatives in other languages.
+- Use ${languageTitle} for solution code. Answer prose in the language of the question.
 - All code blocks must use triple backticks with the exact language tag: \`\`\`${fenceTag}\`\`\`.
 - Aim for the best possible time and space complexity; prefer optimal algorithms and data structures.
 - Provide: brief approach, then final ${languageTitle} implementation, followed by time/space complexity.
-- If the user's input is a problem statement (and does not include code), produce a complete, runnable ${languageTitle} solution without asking for clarification.
+- For coding tasks, provide complete ${languageTitle} code in the supplied signature or template; do not force standard input/output into function-only tasks.
+- For conceptual questions and follow-ups, answer the new point directly; code is optional unless requested.
 - Avoid unnecessary verbosity; focus on correctness, clarity, and efficiency.`;
         break;
       default:
