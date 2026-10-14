@@ -3,7 +3,6 @@
   <head>
     <meta charset="UTF-8" />
     <title>OpenCluely</title>
-    <link href="./dist/output.css" rel="stylesheet" />
     <link href="./src/styles/common.css" rel="stylesheet" />
     <style>
       body {
@@ -358,13 +357,20 @@
         <span>⌘⇧S</span>
       </div>
       <div class="command-separator"></div>
-      <div class="command-item" id="micButton">
-        <i class="fas fa-microphone"></i>
+      <div class="command-item" id="micButton" title="Capture computer audio (Alt+R)">
+        <i class="fas fa-volume-up"></i>
       </div>
       <div class="command-separator"></div>
       <div class="command-item" id="skillIndicator">
         <i class="fas fa-brain"></i>
-        <span>DSA</span>
+        <select id="activeSkill" title="Skill">
+<option value="dsa">DSA</option>
+<option value="devops">DevOps</option>
+<option value="analyst">Аналитик</option>
+<option value="backend">Backend dev</option>
+<option value="ml-engineer">ML Engineer</option>
+<option value="ai-engineer">AI Engineer</option>
+</select>
       </div>
       <div class="command-separator"></div>
       <div class="command-item" id="languageSelector">
@@ -375,6 +381,7 @@
           <option value="python">Python</option>
           <option value="java">Java</option>
           <option value="javascript">JavaScript</option>
+                            <option value="go">Go</option>
         </select>
       </div>
       <div class="command-separator"></div>
@@ -455,6 +462,7 @@
       </div>
     </div>
 
+    <script src="./src/ui/system-audio-capture.js"></script>
     <script src="./src/ui/main-window.js"></script>
   </body>
 </html>

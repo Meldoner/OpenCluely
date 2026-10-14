@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { getAISettings, isConfiguredKey } = require('./ai-settings');
 
 /**
  * First-run detection and onboarding helper.
@@ -8,7 +9,7 @@ const os = require('os');
  * Responsibilities:
  *   - Decide whether this is the user's first launch of OpenCluely
  *   - Auto-create a default `.env` from `env.example` if one is missing
- *   - Report whether a Gemini API key is configured (the only required key)
+ *   - Report whether credentials for the selected AI provider are configured
  *   - Persist a "first-run completed" sentinel so we don't nag on every launch
  *
  * The settings UI is the source of truth for API-key entry. This module
@@ -30,9 +31,7 @@ class FirstRunManager {
   needsOnboarding() {
     if (!fs.existsSync(this.sentinelPath)) return true;
     if (!fs.existsSync(this.envPath)) return true;
-    const content = this._readEnv();
-    const gemini = (content.GEMINI_API_KEY || '').trim();
-    return !gemini || gemini === 'your_gemini_api_key_here';
+    return !getAISettings(this._readEnv()).configured;
   }
 
   /**
@@ -84,6 +83,9 @@ class FirstRunManager {
       envExists: fs.existsSync(this.envPath),
       sentinelExists: fs.existsSync(this.sentinelPath),
       geminiConfigured: !!gemini && gemini !== 'your_gemini_api_key_here',
+      llmProvider: env.LLM_PROVIDER || 'gemini',
+      llmConfigured: getAISettings(env).configured,
+      openaiConfigured: isConfiguredKey(env.OPENAI_API_KEY),
       azureConfigured: !!(env.AZURE_SPEECH_KEY || '').trim() && !!(env.AZURE_SPEECH_REGION || '').trim(),
       whisperConfigured: !!(env.WHISPER_COMMAND || '').trim(),
       needsOnboarding: this.needsOnboarding()

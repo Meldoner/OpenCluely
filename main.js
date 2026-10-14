@@ -77,6 +77,7 @@ app.commandLine.appendSwitch("no-pings");
 
 const logger = require("./src/core/logger").createServiceLogger("MAIN");
 const config = require("./src/core/config");
+const { configureNetworkSession } = require('./src/core/network-session');
 const FirstRunManager = require("./src/core/first-run");
 
 // ── Global crash guard ──
@@ -107,14 +108,19 @@ const llmService = require("./src/services/llm.service");
 // Managers
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
+const skills = require('./src/core/skills');
+const { DEFAULTS } = require('./src/core/ai-settings');
+const { validateEndpoint } = require('./src/services/ai-http');
+const { configureSystemAudioSession } = require('./src/core/system-audio-session');
 
 class ApplicationController {
   constructor() {
     this.isReady = false;
     this.starting = false;
-    this.activeSkill = "dsa";
+    this.activeSkill = skills.some(skill => skill.id === process.env.ACTIVE_SKILL) ? process.env.ACTIVE_SKILL : 'dsa';
   // Default to C++ so language is enforced from first run
-  this.codingLanguage = "cpp";
+    this.codingLanguage = process.env.CODING_LANGUAGE || 'cpp';
+    sessionManager.setActiveSkill(this.activeSkill);
     this.speechAvailable = false;
 
     // Utterance coalescing: VAD emits a transcript per natural pause, but a
@@ -306,34 +312,13 @@ class ApplicationController {
   }
 
   setupNetworkConfiguration() {
-    // Configure session to handle network requests better
-    const ses = session.defaultSession;
-    
-    // Allow HTTPS requests to Google APIs
-    ses.webRequest.onBeforeSendHeaders((details, callback) => {
-      if (details.url.includes('generativelanguage.googleapis.com')) {
-        const platformUA = process.platform === 'darwin'
-          ? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36'
-          : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
-        details.requestHeaders['User-Agent'] = platformUA;
-      }
-      callback({ requestHeaders: details.requestHeaders });
-    });
-    
-    // Handle certificate errors for Google APIs
-    ses.setCertificateVerifyProc((request, callback) => {
-      if (request.hostname === 'generativelanguage.googleapis.com') {
-        callback(0); // Trust Google's certificates
-      } else {
-        callback(-2); // Use default verification
-      }
-    });
-    
-    logger.debug('Network configuration applied for Gemini API');
+    configureNetworkSession(session.defaultSession);
+    logger.debug('Network configuration applied for AI APIs');
   }
 
   setupPermissions() {
     const appSession = session.defaultSession;
+    configureSystemAudioSession(appSession, require('electron').desktopCapturer, () => windowManager.getWindow('main'));
     const isTrustedAppContents = (webContents) => {
       if (!webContents || webContents.isDestroyed()) {
         return false;
@@ -456,6 +441,23 @@ class ApplicationController {
   }
 
   setupIPCHandlers() {
+    const isMainAudioSender = event => event.sender === windowManager.getWindow('main')?.webContents;
+    ipcMain.handle('get-audio-capture-settings', async event => {
+      if (!isMainAudioSender(event)) throw new Error('Audio capture is owned by the main window');
+      if (process.platform === 'darwin') {
+        if (!(process.env.SYSTEM_AUDIO_DEVICE || '').trim()) throw new Error('Configure a virtual loopback device name in Settings before recording on macOS.');
+        const allowed = await require('electron').systemPreferences.askForMediaAccess('microphone');
+        if (!allowed) throw new Error('Allow access to the virtual loopback audio input in macOS Privacy settings.');
+      }
+      return { platform: process.platform, deviceLabel: process.env.SYSTEM_AUDIO_DEVICE || '' };
+    });
+    ipcMain.on('audio-capture-error', (event, message) => {
+      if (!isMainAudioSender(event)) return;
+      speechService.stopRecording();
+      speechService.emit('error', String(message || 'System audio capture failed').slice(0, 300));
+    });
+    ipcMain.handle('get-available-skills', () => skills);
+    ipcMain.handle('test-llm-connection', () => llmService.testConnection());
   ipcMain.handle("take-screenshot", () => this.triggerScreenshotOCR());
   ipcMain.handle("list-displays", () => captureService.listDisplays());
   ipcMain.handle("capture-area", (event, options) => captureService.captureAndProcess(options));
@@ -487,10 +489,12 @@ class ApplicationController {
     });
 
     // Raw PCM audio captured by the renderer's Web Audio API (Windows Whisper path)
-    ipcMain.on("audio-chunk", (_event, data) => {
-      if (data && data.buffer) {
-        speechService.handleAudioChunkFromRenderer(Buffer.from(data.buffer));
-      }
+    ipcMain.on("audio-chunk", (event, data) => {
+      if (!isMainAudioSender(event) || !data?.buffer) return;
+      try {
+        const chunk = Buffer.from(data.buffer);
+        if (chunk.length && chunk.length <= 1024 * 1024 && chunk.length % 2 === 0) speechService.handleAudioChunkFromRenderer(chunk);
+      } catch (_) { logger.warn('Invalid audio chunk rejected'); }
     });
 
     // Also handle direct send events for fallback
@@ -849,9 +853,7 @@ class ApplicationController {
     });
 
     ipcMain.handle("update-active-skill", (event, skill) => {
-      this.activeSkill = skill;
-      windowManager.broadcastToAllWindows("skill-changed", { skill });
-      return { success: true };
+      return this.saveSettings({ activeSkill: skill });
     });
 
     ipcMain.handle("restart-app-for-stealth", () => {
@@ -924,8 +926,7 @@ class ApplicationController {
 
     // Handle update skill
     ipcMain.on("update-skill", (event, skill) => {
-      this.activeSkill = skill;
-      windowManager.broadcastToAllWindows("skill-updated", { skill });
+      this.saveSettings({ activeSkill: skill });
     });
 
     // Handle quit app (alternative method)
@@ -1050,7 +1051,7 @@ class ApplicationController {
     }
 
     const newSkill = availableSkills[newIndex];
-    this.activeSkill = newSkill;
+    this.saveSettings({ activeSkill: newSkill });
 
     // Update session manager with the new skill
     sessionManager.setActiveSkill(newSkill);
@@ -1072,6 +1073,7 @@ class ApplicationController {
     }
 
     const startTime = Date.now();
+    let messageId = null;
 
     try {
       windowManager.showLLMLoading();
@@ -1087,11 +1089,11 @@ class ApplicationController {
       // Use image directly with LLM and active skill; do not send chat messages here
       const sessionHistory = sessionManager.getOptimizedHistory();
 
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = skills.filter(skill => skill.coding).map(skill => skill.id);
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
-      const messageId = `img-${Date.now()}-${this._responseSeq}`;
+      messageId = `img-${Date.now()}-${this._responseSeq}`;
       windowManager.broadcastToAllWindows("transcription-llm-response-start", {
         messageId,
         skill: this.activeSkill
@@ -1122,6 +1124,7 @@ class ApplicationController {
       this.broadcastTranscriptionLLMResponse(llmResult);
 
       windowManager.showLLMResponse(llmResult.response, {
+        messageId,
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
@@ -1134,7 +1137,7 @@ class ApplicationController {
       });
 
       windowManager.hideLLMResponse();
-      this.broadcastOCRError(error.message);
+      this.broadcastOCRError(error.message, messageId);
       
       sessionManager.addConversationEvent({
         role: 'system',
@@ -1148,16 +1151,17 @@ class ApplicationController {
   }
 
   async processWithLLM(text, sessionHistory) {
+    let messageId = null;
     try {
       // Add user input to session memory
       sessionManager.addUserInput(text, 'llm_input');
 
       // Check if current skill needs programming language context
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = skills.filter(skill => skill.coding).map(skill => skill.id);
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
-      const messageId = `chat-${Date.now()}-${this._responseSeq}`;
+      messageId = `chat-${Date.now()}-${this._responseSeq}`;
       windowManager.broadcastToAllWindows("transcription-llm-response-start", {
         messageId,
         skill: this.activeSkill
@@ -1196,6 +1200,7 @@ class ApplicationController {
       this.broadcastTranscriptionLLMResponse(llmResult);
 
       windowManager.showLLMResponse(llmResult.response, {
+        messageId,
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
@@ -1217,7 +1222,7 @@ class ApplicationController {
         }
       });
 
-      this.broadcastLLMError(error.message);
+      this.broadcastLLMError(error.message, messageId);
     }
   }
 
@@ -1322,7 +1327,7 @@ class ApplicationController {
       });
 
       // Check if current skill needs programming language context
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = skills.filter(skill => skill.coding).map(skill => skill.id);
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       // Stream the answer progressively to the configured speech target.
@@ -1362,6 +1367,7 @@ class ApplicationController {
       this.sendTranscriptionLLMResponseToVoiceTargets(llmResult);
       if (this.shouldShowVoiceOverlay()) {
         windowManager.showLLMResponse(llmResult.response, {
+          messageId,
           skill: this.activeSkill,
           processingTime: llmResult.metadata.processingTime,
           usedFallback: llmResult.metadata.usedFallback,
@@ -1384,6 +1390,12 @@ class ApplicationController {
         text: text ? text.substring(0, 100) : 'undefined'
       });
 
+      if (llmService.provider !== 'gemini') {
+        this.broadcastLLMError(error.message, messageId);
+        if (this.shouldShowVoiceOverlay()) windowManager.hideLLMResponse();
+        return;
+      }
+
       // Try to provide a fallback response
       try {
         const fallbackResult = llmService.generateIntelligentFallbackResponse(text, this.activeSkill);
@@ -1404,6 +1416,7 @@ class ApplicationController {
         this.sendTranscriptionLLMResponseToVoiceTargets(fallbackResult);
         if (this.shouldShowVoiceOverlay()) {
           windowManager.showLLMResponse(fallbackResult.response, {
+            messageId,
             skill: this.activeSkill,
             processingTime: fallbackResult.metadata.processingTime,
             usedFallback: true,
@@ -1419,6 +1432,7 @@ class ApplicationController {
         logger.error("Fallback response also failed", {
           fallbackError: fallbackError.message
         });
+        this.broadcastLLMError(error.message, messageId);
 
         sessionManager.addConversationEvent({
           role: 'system',
@@ -1440,8 +1454,9 @@ class ApplicationController {
     });
   }
 
-  broadcastOCRError(errorMessage) {
+  broadcastOCRError(errorMessage, messageId = null) {
     windowManager.broadcastToAllWindows("ocr-error", {
+      messageId,
       error: errorMessage,
       timestamp: new Date().toISOString(),
     });
@@ -1464,8 +1479,9 @@ class ApplicationController {
     windowManager.broadcastToAllWindows("llm-response", broadcastData);
   }
 
-  broadcastLLMError(errorMessage) {
+  broadcastLLMError(errorMessage, messageId = null) {
     windowManager.broadcastToAllWindows("llm-error", {
+      messageId,
       error: errorMessage,
       timestamp: new Date().toISOString(),
     });
@@ -1607,6 +1623,15 @@ class ApplicationController {
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
       geminiKey: process.env.GEMINI_API_KEY || "",
+      llmProvider: process.env.LLM_PROVIDER || 'gemini',
+      openaiKey: process.env.OPENAI_API_KEY || '',
+      openaiModel: process.env.OPENAI_MODEL || DEFAULTS.openaiModel,
+      openaiBaseUrl: process.env.OPENAI_BASE_URL || DEFAULTS.openaiBaseUrl,
+      cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID || '',
+      cloudflareToken: process.env.CLOUDFLARE_API_TOKEN || '',
+      cloudflareModel: process.env.CLOUDFLARE_MODEL || DEFAULTS.cloudflareModel,
+      cloudflareWhisperModel: process.env.CLOUDFLARE_WHISPER_MODEL || DEFAULTS.cloudflareWhisperModel,
+      systemAudioDevice: process.env.SYSTEM_AUDIO_DEVICE || '',
 
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
       speechAvailable: this.speechAvailable
@@ -1615,137 +1640,64 @@ class ApplicationController {
 
   saveSettings(settings) {
     try {
-      // ── In-memory updates + window broadcasts ──
+      if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Invalid settings');
+      const mapping = {
+        llmProvider: 'LLM_PROVIDER', geminiKey: 'GEMINI_API_KEY',
+        openaiKey: 'OPENAI_API_KEY', openaiModel: 'OPENAI_MODEL', openaiBaseUrl: 'OPENAI_BASE_URL',
+        cloudflareAccountId: 'CLOUDFLARE_ACCOUNT_ID', cloudflareToken: 'CLOUDFLARE_API_TOKEN',
+        cloudflareModel: 'CLOUDFLARE_MODEL', cloudflareWhisperModel: 'CLOUDFLARE_WHISPER_MODEL',
+        speechProvider: 'SPEECH_PROVIDER', systemAudioDevice: 'SYSTEM_AUDIO_DEVICE',
+        azureKey: 'AZURE_SPEECH_KEY', azureRegion: 'AZURE_SPEECH_REGION',
+        whisperCommand: 'WHISPER_COMMAND', whisperModel: 'WHISPER_MODEL', whisperLanguage: 'WHISPER_LANGUAGE',
+        whisperDevice: 'WHISPER_DEVICE', whisperCaptureMode: 'WHISPER_CAPTURE_MODE',
+        whisperResponseTarget: 'WHISPER_RESPONSE_TARGET', whisperSegmentMs: 'WHISPER_SEGMENT_MS',
+        codingLanguage: 'CODING_LANGUAGE', activeSkill: 'ACTIVE_SKILL'
+      };
+      const enums = {
+        llmProvider: ['gemini', 'openai', 'cloudflare'], speechProvider: ['whisper', 'azure', 'cloudflare', 'disabled'],
+        codingLanguage: ['cpp', 'c', 'python', 'java', 'javascript', 'go'], activeSkill: skills.map(skill => skill.id),
+        whisperDevice: ['auto', 'cpu', 'cuda'], whisperCaptureMode: ['vad', 'manual'], whisperResponseTarget: ['chat', 'overlay', 'both'],
+        cloudflareWhisperModel: ['@cf/openai/whisper', '@cf/openai/whisper-large-v3-turbo']
+      };
+      const updates = {};
+      for (const [field, envKey] of Object.entries(mapping)) {
+        if (settings[field] === undefined) continue;
+        if (!['string', 'number'].includes(typeof settings[field])) throw new Error('Invalid setting: ' + field);
+        const value = String(settings[field]).trim();
+        if (/[\r\n]/.test(value) || value.length > 4096) throw new Error('Invalid setting: ' + field);
+        if (enums[field] && !enums[field].includes(value)) throw new Error('Unsupported setting: ' + field);
+        if (field === 'openaiBaseUrl' && value) validateEndpoint(value);
+        if (field === 'whisperSegmentMs' && (!Number.isFinite(Number(value)) || Number(value) < 500 || Number(value) > 90000)) throw new Error('Segment duration must be 500?90000 ms');
+        updates[envKey] = value;
+      }
+      const changed = Object.keys(updates).filter(key => (process.env[key] || '') !== updates[key]);
+      const audioKeys = changed.filter(key => /^(SPEECH_|AZURE_|WHISPER_|CLOUDFLARE_|SYSTEM_AUDIO_)/.test(key));
+      if (audioKeys.length && (speechService.isRecording || speechService.isProcessingAudio)) throw new Error('Stop audio capture and wait for transcription before changing speech settings.');
+      const persistedKeys = this.persistEnvUpdates(updates);
+      if (Object.keys(updates).length && !persistedKeys.length) throw new Error('Could not save settings to the configuration file.');
       if (settings.codingLanguage) {
         this.codingLanguage = settings.codingLanguage;
-        windowManager.broadcastToAllWindows("coding-language-changed", {
-          language: settings.codingLanguage,
-        });
+        windowManager.broadcastToAllWindows('coding-language-changed', { language: this.codingLanguage });
       }
-      if (settings.activeSkill) {
+      if (settings.activeSkill && settings.activeSkill !== this.activeSkill) {
         this.activeSkill = settings.activeSkill;
-        windowManager.broadcastToAllWindows("skill-updated", {
-          skill: settings.activeSkill,
-        });
+        sessionManager.setActiveSkill(this.activeSkill);
+        windowManager.broadcastToAllWindows('skill-changed', { skill: this.activeSkill });
+        windowManager.broadcastToAllWindows('skill-updated', { skill: this.activeSkill });
       }
-      if (settings.appIcon) {
-        this.appIcon = settings.appIcon;
+      if (settings.appIcon) this.appIcon = settings.appIcon;
+      if (settings.selectedIcon) { this.appIcon = settings.selectedIcon; this.updateAppIcon(settings.selectedIcon); }
+      if (settings.windowGap !== undefined && Number.isFinite(Number(settings.windowGap))) windowManager.setWindowGap(Number(settings.windowGap));
+      if (changed.some(key => /^(LLM_|GEMINI_|OPENAI_|CLOUDFLARE_)/.test(key))) llmService.initializeClient();
+      if (audioKeys.length) {
+        speechService.initializeClient();
+        this.speechAvailable = speechService.isAvailable();
+        windowManager.broadcastToAllWindows('speech-availability', { available: this.speechAvailable });
       }
-      if (settings.selectedIcon) {
-        this.appIcon = settings.selectedIcon;
-        this.updateAppIcon(settings.selectedIcon);
-      }
-      if (settings.windowGap !== undefined) {
-        const gap = Number(settings.windowGap);
-        if (Number.isFinite(gap)) windowManager.setWindowGap(gap);
-      }
-
-      // ── Persist provider / API-key fields back to .env ──
-      // The settings UI is now the source of truth for these values.
-      // Writing to .env ensures they survive app restarts and are picked
-      // up the next time the app boots.
-      const envUpdates = {};
-      if (settings.speechProvider === "azure" || settings.speechProvider === "whisper") {
-        envUpdates.SPEECH_PROVIDER = settings.speechProvider;
-      }
-      if (settings.azureKey !== undefined) {
-        envUpdates.AZURE_SPEECH_KEY = settings.azureKey;
-      }
-      if (settings.azureRegion !== undefined) {
-        envUpdates.AZURE_SPEECH_REGION = settings.azureRegion;
-      }
-      if (settings.whisperCommand !== undefined) {
-        envUpdates.WHISPER_COMMAND = settings.whisperCommand;
-      }
-      if (settings.whisperModel !== undefined) {
-        envUpdates.WHISPER_MODEL = settings.whisperModel;
-      }
-      if (settings.whisperLanguage !== undefined) {
-        envUpdates.WHISPER_LANGUAGE = settings.whisperLanguage;
-      }
-      if (["auto", "cpu", "cuda"].includes(settings.whisperDevice)) {
-        envUpdates.WHISPER_DEVICE = settings.whisperDevice;
-      }
-      if (["manual", "vad"].includes(settings.whisperCaptureMode)) {
-        envUpdates.WHISPER_CAPTURE_MODE = settings.whisperCaptureMode;
-      }
-      if (["chat", "overlay", "both"].includes(settings.whisperResponseTarget)) {
-        envUpdates.WHISPER_RESPONSE_TARGET = settings.whisperResponseTarget;
-      }
-      if (settings.whisperSegmentMs !== undefined) {
-        envUpdates.WHISPER_SEGMENT_MS = String(settings.whisperSegmentMs);
-      }
-      if (settings.geminiKey !== undefined) {
-        envUpdates.GEMINI_API_KEY = settings.geminiKey;
-      }
-
-      // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
-      // mutates process.env in place, so comparing afterwards would always read
-      // equal and skip the speech re-init below (the exact stale-mic-after-install
-      // bug the re-init guards against).
-      const prevWhisperCommand = process.env.WHISPER_COMMAND || '';
-
-      const persistedKeys = this.persistEnvUpdates(envUpdates);
-
-      // If the Gemini key was just saved, reinitialize the LLM service
-      // so the new client picks up the key. Without this, the test-
-      // connection button in the onboarding wizard fails with
-      // "Service not initialized" because the client was first created
-      // at app startup, before any key was set.
-      if (settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) {
-        try {
-          llmService.initializeClient();
-          logger.info("LLM service reinitialized after Gemini key update");
-        } catch (e) {
-          logger.warn("Failed to reinitialize LLM service after Gemini key update", {
-            error: e.message
-          });
-        }
-      }
-
-      // Reinitialize speech service when provider OR whisper command
-      // changes. Without the second check, the install flow (which
-      // writes a new whisperCommand after install but keeps the same
-      // provider) would leave the speech service pointing at a stale
-      // (or non-existent) binary, and the main overlay's mic button
-      // would stay hidden / non-functional.
-      const providerChanged = settings.speechProvider && speechService.provider !== settings.speechProvider;
-      const whisperCommandChanged = settings.whisperCommand !== undefined &&
-        prevWhisperCommand !== String(settings.whisperCommand || '');
-      if (providerChanged || whisperCommandChanged) {
-        try {
-          speechService.initializeClient();
-          this.speechAvailable = speechService.isAvailable
-            ? speechService.isAvailable()
-            : false;
-          // Broadcast so any open window (settings, overlay, chat)
-          // can react immediately — especially the main overlay's
-          // mic button, which queries availability on load.
-          const { BrowserWindow } = require("electron");
-          BrowserWindow.getAllWindows().forEach((win) => {
-            if (!win.isDestroyed()) {
-              win.webContents.send("speech-availability", { available: this.speechAvailable });
-            }
-          });
-          logger.info('Speech service reinitialized after settings change', {
-            providerChanged,
-            whisperCommandChanged,
-            speechAvailable: this.speechAvailable,
-          });
-        } catch (e) {
-          logger.warn("Failed to reinitialize speech service after settings change", {
-            error: e.message
-          });
-        }
-      }
-
-      logger.info("Settings saved successfully", {
-        ...settings,
-        persistedEnvKeys: persistedKeys
-      });
+      logger.info('Settings saved', { persistedEnvKeys: persistedKeys });
       return { success: true, persistedEnvKeys: persistedKeys };
     } catch (error) {
-      logger.error("Failed to save settings", { error: error.message });
+      logger.error('Failed to save settings', { error: error.message });
       return { success: false, error: error.message };
     }
   }
@@ -1753,7 +1705,7 @@ class ApplicationController {
   persistSettings(settings) {
     // You can extend this to save to a file or database
     // For now, we'll just keep them in memory
-    logger.debug("Settings persisted", settings);
+    logger.debug("Settings persisted", { fields: Object.keys(settings || {}) });
   }
 
   /**
@@ -1808,12 +1760,6 @@ class ApplicationController {
       }
     }
 
-    // Update process.env so the running app picks up the new values
-    // immediately (and so the settings UI reads the same source of truth).
-    for (const key of keys) {
-      process.env[key] = String(updates[key]);
-    }
-
     const newContent = outLines.join("\n");
     try {
       const tmpPath = envPath + ".tmp";
@@ -1827,6 +1773,7 @@ class ApplicationController {
       return [];
     }
 
+    for (const key of keys) process.env[key] = String(updates[key]);
     logger.info("Persisted .env updates", { keys: Array.from(updated) });
     return Array.from(updated);
   }

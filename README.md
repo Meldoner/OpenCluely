@@ -34,7 +34,10 @@ It is free and open source. Processing stays on your machine, and the only thing
 
 - **Invisible overlay.** Windows stay out of Zoom, Google Meet, Microsoft Teams, Discord, and OBS captures. You see the answer, the call does not.
 - **Hidden during screen share.** When a share starts, the app can hide every window on its own.
-- **Flexible local voice.** Choose manual start/stop capture or automatic voice-activity detection without fixed-timer sentence cuts.
+- **Computer audio capture.** Record the sound playing through your computer output, with manual start/stop or automatic voice-activity detection. The app never falls back to the default microphone.
+- **Multiple AI providers.** Choose Gemini, OpenAI, an OpenAI-compatible endpoint, or Cloudflare Workers AI independently of the transcription provider.
+- **Local or cloud Whisper.** Use local Whisper, Cloudflare Whisper / Whisper Large v3 Turbo, or Azure Speech for transcription.
+- **Role-specific assistance.** DSA, DevOps, Analyst (product, data, business and systems), Backend dev, ML Engineer and AI Engineer, with Go alongside the existing coding languages.
 - **Configurable streamed answers.** Route voice replies to chat, the floating overlay, or both.
 - **Direct image analysis.** Screenshots go straight to Gemini for visual reasoning, with no slow OCR step in between.
 - **Session memory.** The whole conversation is remembered, so follow-ups, edge cases, and optimizations keep their context.
@@ -77,9 +80,11 @@ If you would rather build from source, three steps are all it takes.
 
    The script installs Node dependencies, creates your `.env` from the example, sets up a local Whisper virtual environment, points the config at it, and launches the app.
 
-3. Add your Gemini key.
+3. Configure your AI provider.
 
-   On first launch the Settings window opens automatically. Get a free key from [Google AI Studio](https://aistudio.google.com/) and paste it in, or edit `.env` directly. Both work, and changes are picked up without a restart.
+   On first launch the onboarding wizard opens. Choose Gemini, OpenAI / Compatible API, or Cloudflare Workers AI and enter the corresponding credentials. The same fields are available in Settings, and changes apply without a restart. Gemini keys are available from [Google AI Studio](https://aistudio.google.com/).
+
+   For a direct source launch, including Windows PowerShell, use `npm ci` followed by `npm start`. `setup.sh` is optional when you want it to bootstrap local Whisper; Cloudflare Whisper needs no Python installation or local model download.
 
 ### Platform notes
 
@@ -94,17 +99,27 @@ If you would rather build from source, three steps are all it takes.
 ./setup.sh --build                # Build a distributable for your OS
 ./setup.sh --ci                   # Use npm ci instead of npm install
 ./setup.sh --no-run               # Set up only, do not launch
-./setup.sh --install-system-deps  # Install sox for the microphone (optional)
+./setup.sh --install-system-deps  # Legacy recorder bootstrap (optional)
 ./setup.sh --skip-whisper         # Skip the local Whisper bootstrap
 ```
 
 ## Configuration
 
-The setup script writes sensible defaults. The only required value is a Gemini API key.
+The setup script writes defaults. Configure credentials for the selected AI provider; a Gemini key is only required when using Gemini. All provider fields can be edited in Settings.
 
 ```bash
-# Required
+# AI answers: gemini, openai, cloudflare
+LLM_PROVIDER=gemini
 GEMINI_API_KEY=your_gemini_api_key_here
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o-mini
+
+# Shared by Workers AI answers and Cloudflare Whisper
+CLOUDFLARE_ACCOUNT_ID=
+CLOUDFLARE_API_TOKEN=
+CLOUDFLARE_MODEL=@cf/meta/llama-3.3-70b-instruct-fp8-fast
+CLOUDFLARE_WHISPER_MODEL=@cf/openai/whisper
 
 # Optional speech provider. Pick one.
 SPEECH_PROVIDER=whisper
@@ -124,13 +139,27 @@ WHISPER_CAPTURE_MODE=vad
 WHISPER_RESPONSE_TARGET=both
 WHISPER_MANUAL_MAX_MS=90000
 WHISPER_GPU_IDLE_MS=60000
+
+# UI preferences
+CODING_LANGUAGE=go
+ACTIVE_SKILL=backend
 ```
 
-Speech is optional. If no provider is configured, the microphone button hides itself across the app.
+For Cloudflare, enter your 32-character Account ID and an API Token with Workers AI access. Select `Cloudflare Workers AI` for answers and/or `Cloudflare Whisper` for speech. These choices are independent: OpenAI answers can use Cloudflare transcription, and Cloudflare answers can use local Whisper. Cloudflare's token is separate from an OpenAI API key.
+
+Cloudflare answers use its [OpenAI-compatible Chat Completions endpoint](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/). Transcription uses the [Whisper REST model](https://developers.cloudflare.com/workers-ai/models/whisper/) or [Whisper Large v3 Turbo](https://developers.cloudflare.com/workers-ai/models/whisper-large-v3-turbo/). The default Cloudflare chat model is for text; choose a model with image support to analyze screenshots. Custom OpenAI-compatible base URLs must use HTTPS, except localhost endpoints.
+
+Requests inside Electron use Chromium networking so the system proxy is respected. Gemma 4 on Workers AI uses `chat_template_kwargs.enable_thinking=false`, following the [Cloudflare example](https://developers.cloudflare.com/workers-ai/get-started/workers-wrangler/), to avoid spending a short connection test entirely on hidden reasoning. Connection tests allow 1024 output tokens. API errors now show their HTTP status, provider code and a redacted explanation; chat clears its thinking indicator on failure.
+
+To check the saved Cloudflare settings on Windows, run `node scripts/run-electron.js scripts/check-cloudflare-connection.js`. It tests ordinary and streamed requests using a fixed prompt, without printing credentials or sending conversation history. To use another configuration file, pass its path as the final argument. This manual check makes real API requests; it is separate from `npm test`.
+
+Audio capture reads computer output. On Windows it uses system loopback and works with speakers or headphones. On Linux it records the default PulseAudio/PipeWire output monitor through `parec` (`pulseaudio-utils`). On macOS, the current Electron 29 runtime requires a virtual loopback device such as BlackHole: route system output to it and enter its exact audio input label in Settings (`SYSTEM_AUDIO_DEVICE`). If capture fails, the app reports an error without switching to a microphone.
+
+Speech is optional. If no provider is configured, the audio capture button hides itself across the app.
 
 ## Optional voice setup
 
-You can use local Whisper for offline transcription or Azure Speech for a cloud option.
+You can use local Whisper for offline transcription, Cloudflare Whisper without a local installation, or Azure Speech. Cloud speech providers receive the captured audio; local Whisper keeps transcription on your machine. Transcribed text is then sent to the selected AI provider for answers.
 
 For local Whisper, `./setup.sh` handles the full setup. It creates `.venv-whisper`, installs `openai-whisper`, points `.env` at the virtual environment, creates `.whisper-models`, and runs a quick speech test. The app reads its own PCM WAV recordings directly; ffmpeg is only needed when transcribing other audio formats through the CLI fallback.
 
@@ -139,7 +168,7 @@ For Azure Speech, create a Speech resource in the [Azure Portal](https://portal.
 ## How it works
 
 1. **Ask.** Use automatic pause detection, choose manual start/stop capture in Settings, or use the screenshot shortcut.
-2. **Reason.** Gemini reads the audio or image with full conversation context and works toward a precise answer.
+2. **Reason.** The selected AI provider analyzes the transcription or screenshot using the active skill prompt. Text requests include recent conversation context.
 3. **Answer.** Voice responses stream to chat, the overlay, or both, according to Settings.
 
 ## Keyboard shortcuts
@@ -177,12 +206,14 @@ OpenCluely is under active development. The core is stable and improvements ship
 
 ### Planned
 
-- Multiple model backends alongside Gemini (OpenAI, Anthropic, local)
+- Additional provider integrations beyond Gemini, OpenAI-compatible APIs and Cloudflare Workers AI
 - Auto typing of code snippets into editors and IDEs
 - Export of conversation history to markdown or PDF
 - Deeper stealth, including process name randomization
 
 ## Troubleshooting
+
+Development checks: `npm test` runs provider, settings and audio regression tests without real API credentials; `npm run check:syntax` checks JavaScript and inline scripts. `npm run test:ui` opens hidden Electron windows with mocked providers to validate the settings, onboarding and overlay. `node scripts/run-electron.js scripts/test-system-audio.js` probes Windows loopback and immediately releases its tracks without saving audio.
 
 <details>
 <summary>Setup issues</summary>
@@ -199,7 +230,7 @@ OpenCluely is under active development. The core is stable and improvements ship
 - **Electron will not start or shows a blank window on Linux.** Try `npm run dev`, and make sure X11 or XWayland is available in headless setups.
 - **macOS screen capture does not work.** Grant Screen Recording permission under System Settings, Privacy and Security, then relaunch the app.
 - **Windows SmartScreen blocks the app.** Click More info, then Run anyway, or use `npm start` during development.
-- **Microphone or voice not working.** Voice is optional. For Azure, add valid keys to `.env`. For Whisper, install `openai-whisper`, `ffmpeg`, and `sox`, then set `SPEECH_PROVIDER=whisper`.
+- **Computer audio not working.** Configure a transcription provider first. Windows captures the active system output; Linux requires `parec` and an available output monitor; macOS requires a routed virtual loopback input with its exact name in Settings. Cloudflare Whisper requires Workers AI credentials; local Whisper requires its Python environment. The app reports capture errors without switching to a microphone.
 
 </details>
 

@@ -6,8 +6,8 @@
  * everything via the electronAPI bridge exposed by preload.js:
  *
  *   1. Welcome
- *   2. Gemini API key entry + live connection test
- *   3. Speech provider choice (Whisper / Azure / Skip)
+ *   2. AI provider credentials + live connection test
+ *   3. Transcription provider choice (local Whisper / Cloudflare / Azure / Skip)
  *   4. Whisper detect + (optional) install — only shown when whisper
  *   5. Star-the-repo prompt + summary
  */
@@ -42,8 +42,6 @@
   // ── State ─────────────────────────────────────────────────────────
   const state = {
     step: 0,
-    geminiKey: '',
-    geminiConfigured: false, // a key already exists in .env from a prior run
     speechProvider: null, // 'whisper' | 'azure' | 'skip'
     azureKey: '',
     azureRegion: '',
@@ -136,8 +134,9 @@
         return true;
       case 'apikey':
         // A key already in .env is enough — don't force a re-entry.
-        return !!state.geminiKey.trim() || state.geminiConfigured;
+        return providerUI.isConfigured();
       case 'speech':
+        if (state.speechProvider === 'cloudflare') return /^[a-f0-9]{32}$/i.test($('#cloudflareSpeechAccountId').value.trim()) && !!$('#cloudflareSpeechToken').value.trim();
         if (state.speechProvider === 'azure') {
           return !!state.azureKey.trim() && !!state.azureRegion.trim();
         }
@@ -155,47 +154,14 @@
   }
 
   // ── Wire up: API key ──────────────────────────────────────────────
-  const geminiInput = $('#geminiKey');
-  const toggleVis = $('#toggleVis');
+  const providerUI = new ProviderSettings($('#onboardingProviderSettings'));
   const keyStatus = $('#keyStatus');
-
-  function setKeyStatus(state_, text) {
-    keyStatus.className = `status-pill ${state_}`;
+  function setKeyStatus(status, text) {
+    keyStatus.className = 'status-pill ' + status;
     keyStatus.style.display = 'inline-flex';
-    const icon = keyStatus.querySelector('i');
-    const txt = keyStatus.querySelector('.text');
-    if (state_ === 'testing') {
-      icon.className = 'fas fa-circle-notch fa-spin';
-    } else if (state_ === 'success') {
-      icon.className = 'fas fa-check-circle';
-    } else if (state_ === 'error') {
-      icon.className = 'fas fa-circle-xmark';
-    } else {
-      icon.className = 'fas fa-circle-info';
-    }
-    txt.textContent = text;
+    keyStatus.querySelector('.text').textContent = text;
   }
 
-  geminiInput.addEventListener('input', () => {
-    state.geminiKey = geminiInput.value.trim();
-    if (!state.geminiKey) {
-      keyStatus.style.display = 'none';
-    } else if (keyStatus.classList.contains('success')) {
-      // Keep success state — they had a valid key, may be editing
-    } else {
-      setKeyStatus('idle', 'Key entered');
-    }
-  });
-
-  toggleVis.addEventListener('click', () => {
-    const showing = geminiInput.type === 'text';
-    geminiInput.type = showing ? 'password' : 'text';
-    toggleVis.innerHTML = showing
-      ? '<i class="fas fa-eye"></i>'
-      : '<i class="fas fa-eye-slash"></i>';
-  });
-
-  // ── Wire up: Speech choices ───────────────────────────────────────
   $$('#speechChoices .choice-card').forEach((card) => {
     card.addEventListener('click', () => {
       const value = card.dataset.value;
@@ -204,6 +170,11 @@
       card.classList.add('selected');
       const azurePanel = $('#azurePanel');
       azurePanel.style.display = value === 'azure' ? 'block' : 'none';
+      $('#cloudflareSpeechPanel').style.display = value === 'cloudflare' ? 'block' : 'none';
+      providerUI.setSpeechProvider(value);
+      const cloudflare = providerUI.values();
+      $('#cloudflareSpeechAccountId').value = cloudflare.cloudflareAccountId;
+      $('#cloudflareSpeechToken').value = cloudflare.cloudflareToken;
       if (value !== 'azure') {
         state.azureKey = '';
         state.azureRegion = '';
@@ -451,9 +422,9 @@
   function populateSummary() {
     const rows = [];
     rows.push({
-      label: '<i class="fas fa-key"></i> Gemini API',
-      value: (state.geminiKey || state.geminiConfigured) ? 'Configured' : 'Missing',
-      cls: (state.geminiKey || state.geminiConfigured) ? 'ok' : 'skip',
+      label: '<i class="fas fa-key"></i> AI (' + providerUI.provider.value + ')',
+      value: providerUI.isConfigured() ? 'Configured' : 'Missing',
+      cls: providerUI.isConfigured() ? 'ok' : 'skip',
     });
     if (state.speechProvider === 'whisper') {
       rows.push({
@@ -461,6 +432,8 @@
         value: state.whisperDetected ? `Whisper (${state.whisperCmd || 'cli'})` : 'Whisper (not installed)',
         cls: state.whisperDetected ? 'ok' : 'skip',
       });
+    } else if (state.speechProvider === 'cloudflare') {
+      rows.push({ label: 'Speech', value: 'Cloudflare Whisper / system audio', cls: 'ok' });
     } else if (state.speechProvider === 'azure') {
       rows.push({
         label: '<i class="fas fa-cloud"></i> Speech',
@@ -514,24 +487,31 @@
     const name = currentScreenName();
     if (!canAdvance()) {
       // Lightly nudge the user
-      if (name === 'apikey') setKeyStatus('error', 'Enter a Gemini API key');
+      if (name === 'apikey') setKeyStatus('error', 'Enter credentials for the selected AI provider');
       return;
     }
 
     // Persist settings on speech selection (Azure path), since we
-    // already saved geminiKey on test; do it here too if user skipped
+    // persist AI settings here too if the user skipped
     // testing.
-    if (name === 'apikey' && state.geminiKey && window.electronAPI) {
+    if (name === 'apikey' && window.electronAPI) {
       try {
-        await window.electronAPI.saveSettings({ geminiKey: state.geminiKey });
-      } catch (_) { /* surfaced elsewhere */ }
+        const result = await window.electronAPI.saveSettings(providerUI.values());
+        if (!result.success) { setKeyStatus('error', result.error); return; }
+      } catch (error) { setKeyStatus('error', error.message); return; }
     }
     if (name === 'speech' && window.electronAPI) {
       try {
         const payload = {
           speechProvider:
-            state.speechProvider === 'skip' ? 'whisper' : state.speechProvider,
+            state.speechProvider === 'skip' ? 'disabled' : state.speechProvider,
         };
+        if (state.speechProvider === 'cloudflare') {
+          payload.cloudflareAccountId = $('#cloudflareSpeechAccountId').value.trim();
+          payload.cloudflareToken = $('#cloudflareSpeechToken').value.trim();
+          providerUI.inputs.get('cloudflareAccountId').value = payload.cloudflareAccountId;
+          providerUI.inputs.get('cloudflareToken').value = payload.cloudflareToken;
+        }
         if (state.speechProvider === 'azure') {
           payload.azureKey = state.azureKey;
           payload.azureRegion = state.azureRegion;
@@ -539,7 +519,8 @@
         if (state.speechProvider === 'whisper' && state.whisperCmd) {
           payload.whisperCommand = quoteCommandIfNeeded(state.whisperCmd);
         }
-        await window.electronAPI.saveSettings(payload);
+        const result = await window.electronAPI.saveSettings(payload);
+        if (!result.success) { providerUI.status.textContent = result.error; return; }
       } catch (_) { /* surfaced elsewhere */ }
     }
 
@@ -655,18 +636,7 @@
   // ── Boot ──────────────────────────────────────────────────────────
   showScreen('welcome');
 
-  // Pre-populate Gemini key from existing .env (if any) so users with
-  // a partial config don't have to retype.
-  if (window.electronAPI && window.electronAPI.getFirstRunStatus) {
-    window.electronAPI.getFirstRunStatus().then((s) => {
-      if (s && s.geminiConfigured) {
-        // We can't read the key back (settings returns empty for keys),
-        // but we can mark status as success if the env file already has one
-        // and let the user advance without retyping it.
-        state.geminiConfigured = true;
-        setKeyStatus('success', 'Already configured — click Continue');
-        geminiInput.placeholder = '•••••••••••••••• (already set)';
-      }
-    }).catch(() => {});
+  if (window.electronAPI) {
+    window.electronAPI.getSettings().then(settings => providerUI.load(settings)).catch(() => {});
   }
 })();

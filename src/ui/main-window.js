@@ -24,9 +24,8 @@ class MainWindowUI {
         this._captureInterval = null;
         
         // Define available skills for navigation
-        this.availableSkills = [
-            'dsa'
-        ];
+        this.availableSkills = ['dsa'];
+        this.skillLabels = {};
         
         this.init();
     }
@@ -71,6 +70,9 @@ class MainWindowUI {
 
     async loadCurrentSkill() {
         try {
+            const catalogue = await window.electronAPI.getAvailableSkills();
+            this.availableSkills = catalogue.map(skill => skill.id);
+            this.skillLabels = Object.fromEntries(catalogue.map(skill => [skill.id, skill.label]));
             if (window.electronAPI && window.electronAPI.getSettings) {
                 const settings = await window.electronAPI.getSettings();
                 if (settings && settings.activeSkill) {
@@ -173,6 +175,8 @@ class MainWindowUI {
     }
 
     updateSkillIndicatorState() {
+        const select = document.getElementById('activeSkill');
+        if (select) select.disabled = !this.isInteractive;
         if (this.skillIndicator) {
             // Remove both classes first
             this.skillIndicator.classList.remove('interactive', 'non-interactive');
@@ -193,6 +197,8 @@ class MainWindowUI {
     }
 
     updateMicButtonState() {
+        const select = document.getElementById('activeSkill');
+        if (select) select.disabled = !this.isInteractive;
         if (this.micButton) {
             // Also hide when unavailable
             this.applyMicVisibility();
@@ -288,17 +294,11 @@ class MainWindowUI {
             }
         });
 
-        // Skill indicator click handler toggles DSA skill
-        this.skillIndicator.addEventListener('click', () => {
-            if (!this.isInteractive) return;
-            const newSkill = 'dsa';
-            if (window.electronAPI && window.electronAPI.updateActiveSkill) {
-                window.electronAPI.updateActiveSkill(newSkill).then(() => {
-                    this.handleSkillActivated(newSkill);
-                });
-            } else {
-                this.handleSkillActivated(newSkill);
-            }
+        this.skillSelect = document.getElementById('activeSkill');
+        if (this.skillSelect) this.skillSelect.addEventListener('change', async () => {
+            if (!this.isInteractive) { this.skillSelect.value = this.currentSkill; return; }
+            const result = await window.electronAPI.updateActiveSkill(this.skillSelect.value);
+            if (result.success) this.handleSkillActivated(this.skillSelect.value);
         });
 
         // Check for required elements (settingsIndicator is optional)
@@ -310,7 +310,7 @@ class MainWindowUI {
             });
         }
 
-        // Add click handler for microphone
+        // Toggle transcription of computer output audio.
         this.micButton.addEventListener('click', async () => {
             if (this.isInteractive && this.speechAvailable) {
                 try {
@@ -643,173 +643,53 @@ class MainWindowUI {
 
     handleRecordingStarted() {
         this.isRecording = true;
-        if (this.micButton) {
-            this.micButton.classList.add('recording');
-        }
-        // On Windows and macOS, Whisper audio is captured here in the renderer
-        // (Web Audio API) rather than the main process: Windows lacks sox/rec/
-        // arecord, and macOS avoids an unbundled Homebrew `sox`. Must match the
-        // main process's useRendererCapture gate (speech.service.js). Linux uses
-        // the native recorder. navigator.userAgentData is preferred when present
-        // since navigator.platform is deprecated.
-        const platform = (typeof navigator !== 'undefined' &&
-          ((navigator.userAgentData && navigator.userAgentData.platform) ||
-            navigator.platform || '')).toLowerCase();
-        const useRendererCapture = platform.includes('win') || platform.includes('mac');
-        if (useRendererCapture) {
-            this._startRendererAudioCapture();
-        }
-        logger.debug('Recording started', { component: 'MainWindowUI' });
+        if (this.micButton) this.micButton.classList.add('recording');
+        const session = this._audioSession = (this._audioSession || 0) + 1;
+        this._startRendererAudioCapture(session);
     }
 
     handleRecordingStopped() {
         this.isRecording = false;
-        if (this.micButton) {
-            this.micButton.classList.remove('recording');
-        }
+        if (this.micButton) this.micButton.classList.remove('recording');
+        this._audioSession = (this._audioSession || 0) + 1;
         this._stopRendererAudioCapture();
-        logger.debug('Recording stopped', { component: 'MainWindowUI' });
     }
 
-    /**
-     * Capture microphone audio in the renderer using the Web Audio API.
-     * This is used for Whisper on Windows where node-record-lpcm16's sox/rec
-     * dependencies are unavailable.
-     */
-    async _startRendererAudioCapture() {
+    async _startRendererAudioCapture(session = this._audioSession) {
         try {
             this._stopRendererAudioCapture();
-
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    sampleRate: { ideal: 16000 }
-                }
+            const settings = await window.electronAPI.getAudioCaptureSettings();
+            if (!this.isRecording || session !== this._audioSession) return;
+            if (settings.platform === 'linux') return;
+            const capture = new SystemAudioCapture({
+                mediaDevices: navigator.mediaDevices,
+                AudioContext: window.AudioContext || window.webkitAudioContext,
+                platform: settings.platform === 'darwin' ? 'mac' : settings.platform,
+                deviceLabel: settings.deviceLabel,
+                onChunk: chunk => { if (this.isRecording && session === this._audioSession) window.electronAPI.sendAudioChunk(chunk); },
+                onEnded: message => window.electronAPI.reportAudioCaptureError(message)
             });
-            this._mediaStream = stream;
-
-            const audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: 16000
-            });
-            this._audioContext = audioContext;
-
-            const source = audioContext.createMediaStreamSource(stream);
-            const bufferSize = 4096;
-            const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
-            this._scriptNode = scriptNode;
-
-            scriptNode.onaudioprocess = (event) => {
-                if (!this.isRecording || !window.electronAPI || !window.electronAPI.sendAudioChunk) {
-                    return;
-                }
-                const inputData = event.inputBuffer.getChannelData(0);
-                const pcm16 = new Int16Array(inputData.length);
-                for (let i = 0; i < inputData.length; i++) {
-                    const s = Math.max(-1, Math.min(1, inputData[i]));
-                    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                }
-                window.electronAPI.sendAudioChunk(pcm16.buffer);
-            };
-
-            source.connect(scriptNode);
-            scriptNode.connect(audioContext.destination);
-
-            logger.info('Renderer audio capture started', { component: 'MainWindowUI' });
+            this._systemAudioCapture = capture;
+            await capture.start();
         } catch (error) {
-            logger.error('Failed to start renderer audio capture', {
-                component: 'MainWindowUI',
-                error: error.message
-            });
-            // Notify main process so it can stop the recording state
-            try {
-                await window.electronAPI.stopSpeechRecognition();
-            } catch (_) { /* ignore */ }
+            if (session !== this._audioSession) return;
+            this.showNotification(error.message, 'error');
+            window.electronAPI.reportAudioCaptureError(error.message);
         }
     }
 
     _stopRendererAudioCapture() {
-        try {
-            if (this._scriptNode) {
-                this._scriptNode.disconnect();
-                this._scriptNode.onaudioprocess = null;
-                this._scriptNode = null;
-            }
-            if (this._mediaStream) {
-                this._mediaStream.getTracks().forEach((track) => track.stop());
-                this._mediaStream = null;
-            }
-            if (this._audioContext) {
-                this._audioContext.close().catch(() => {});
-                this._audioContext = null;
-            }
-            if (this._captureInterval) {
-                clearInterval(this._captureInterval);
-                this._captureInterval = null;
-            }
-        } catch (error) {
-            logger.error('Error stopping renderer audio capture', {
-                component: 'MainWindowUI',
-                error: error.message
-            });
-        }
+        if (this._systemAudioCapture) this._systemAudioCapture.stop();
+        this._systemAudioCapture = null;
     }
 
     updateSkillIndicator() {
-        const skillNames = {
-            'dsa': 'DSA',
-            'behavioral': 'Behavioral', 
-            'sales': 'Sales',
-            'presentation': 'Presentation',
-            'data-science': 'Data Science',
-            'programming': 'Programming',
-            'devops': 'DevOps',
-            'system-design': 'System Design',
-            'negotiation': 'Negotiation'
-        };
-        
-        logger.info('Updating skill indicator', {
-            component: 'MainWindowUI',
-            currentSkill: this.currentSkill,
-            skillIndicatorExists: !!this.skillIndicator
-        });
-        
-        if (!this.skillIndicator) {
-            logger.error('Skill indicator element not found!');
-            return;
-        }
-        
-        const skillName = skillNames[this.currentSkill] || this.currentSkill.toUpperCase();
-        const skillSpan = this.skillIndicator.querySelector('span');
-        
-        logger.info('Looking for skill span element', {
-            component: 'MainWindowUI',
-            spanExists: !!skillSpan,
-            skillName: skillName
-        });
-        
-        if (skillSpan) {
-            const oldText = skillSpan.textContent;
-            skillSpan.textContent = skillName;
-                        
-            const tooltip = this.isInteractive ? 
-                `${skillName} - Use ⌘↑/↓ to navigate skills` : 
-                `${skillName} - Enable interactive mode (Alt+A) to navigate`;
-            this.skillIndicator.title = tooltip;
-            
-            // Add visual feedback for skill change
-            this.animateSkillChange();
-            
-            logger.info('Skill indicator updated successfully', {
-                component: 'MainWindowUI',
-                oldText: oldText,
-                newText: skillName,
-                interactive: this.isInteractive
-            });
-        } else {
-            logger.error('Skill span element not found within skill indicator!');
-        }
+        const select = document.getElementById('activeSkill');
+        if (!select) return;
+        select.value = this.currentSkill;
+        select.title = this.skillLabels[this.currentSkill] || this.currentSkill;
+        select.disabled = !this.isInteractive;
+        this.animateSkillChange();
     }
 
     animateSkillChange() {

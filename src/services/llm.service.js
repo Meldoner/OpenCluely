@@ -2,6 +2,8 @@ const { GoogleGenAI } = require('@google/genai');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
+const { getAISettings } = require('../core/ai-settings');
+const compatible = require('./openai-compatible.service');
 
 class LLMService {
   constructor() {
@@ -15,9 +17,18 @@ class LLMService {
   }
 
   initializeClient() {
+    this.client = null;
+    this.isInitialized = false;
+    const settings = getAISettings();
+    this.provider = settings.provider;
+    this.model = settings.model;
+    if (this.provider !== 'gemini') {
+      this.isInitialized = settings.configured;
+      return;
+    }
     const apiKey = config.getApiKey('GEMINI');
     
-    if (!apiKey || apiKey === 'your-api-key-here') {
+    if (!settings.configured) {
       logger.warn('Gemini API key not configured', { 
         keyExists: !!apiKey,
         isPlaceholder: apiKey === 'your-api-key-here'
@@ -123,7 +134,7 @@ class LLMService {
    */
   async processImageWithSkill(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Configure the selected AI provider in Settings.');
     }
 
     if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
@@ -170,6 +181,7 @@ class LLMService {
           responseText = await this.executeRequest(request);
         }
       } catch (error) {
+        if (this.provider !== 'gemini') throw error;
         const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
         logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, { error: error.message });
         const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
@@ -218,7 +230,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      if (config.get('llm.gemini.fallbackEnabled')) {
+      if (this.provider === 'gemini' && config.get('llm.gemini.fallbackEnabled')) {
         return this.generateFallbackResponse('[image]', activeSkill);
       }
       throw error;
@@ -227,7 +239,7 @@ class LLMService {
 
   async processImageWithSkillStream(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Configure the selected AI provider in Settings.');
     }
 
     if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
@@ -304,7 +316,7 @@ class LLMService {
 
   async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Configure the selected AI provider in Settings.');
     }
 
     const startTime = Date.now();
@@ -331,6 +343,7 @@ class LLMService {
           response = await this.executeRequest(geminiRequest);
         }
       } catch (error) {
+        if (this.provider !== 'gemini') throw error;
         const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
         logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
           error: error.message,
@@ -381,7 +394,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      if (config.get('llm.gemini.fallbackEnabled')) {
+      if (this.provider === 'gemini' && config.get('llm.gemini.fallbackEnabled')) {
         return this.generateFallbackResponse(text, activeSkill);
       }
 
@@ -391,7 +404,7 @@ class LLMService {
 
   async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Configure the selected AI provider in Settings.');
     }
 
     const startTime = Date.now();
@@ -439,7 +452,7 @@ class LLMService {
 
   async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Configure the selected AI provider in Settings.');
     }
 
     const startTime = Date.now();
@@ -466,6 +479,7 @@ class LLMService {
           response = await this.executeRequest(geminiRequest);
         }
       } catch (error) {
+        if (this.provider !== 'gemini') throw error;
         const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
         logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
           error: error.message,
@@ -517,7 +531,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      if (config.get('llm.gemini.fallbackEnabled')) {
+      if (this.provider === 'gemini' && config.get('llm.gemini.fallbackEnabled')) {
         return this.generateIntelligentFallbackResponse(text, activeSkill);
       }
       
@@ -530,27 +544,9 @@ class LLMService {
    * Does not alter the inner code; only ensures fence language tags are correct.
    */
   enforceProgrammingLanguage(text, programmingLanguage) {
-    try {
-      if (!text || !programmingLanguage) return text;
-      const norm = String(programmingLanguage).toLowerCase();
-      const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
-      const fenceTag = fenceTagMap[norm] || norm || 'text';
-
-      // Replace all triple-backtick fences' language token with the selected tag
-      const replacedBackticks = text.replace(/```([^\n]*)\n/g, (match, info) => {
-        const current = (info || '').trim();
-        // If already the desired fenceTag as the first token, keep as is
-        if (current.split(/\s+/)[0].toLowerCase() === fenceTag) return match;
-        return '```' + fenceTag + '\n';
-      });
-
-      // Optionally normalize tildes fences to backticks with correct tag
-      const normalizedTildes = replacedBackticks.replace(/~~~([^\n]*)\n/g, () => '```' + fenceTag + '\n');
-
-      return normalizedTildes;
-    } catch (_) {
-      return text;
-    }
+    // The prompt controls language. Relabeling fences corrupts SQL, shell and
+    // infrastructure examples and cannot translate code into another language.
+    return text;
   }
 
   buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage) {
@@ -719,9 +715,9 @@ class LLMService {
 
     this.applyGenerationDefaults(request);
 
-  // For chat/transcription messages, DO NOT include the full skill prompt; use only the intelligent filter prompt
-  const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
-  request.systemInstruction = { parts: [{ text: intelligentPrompt }] };
+    // Role expertise applies to voice questions as well as typed chat.
+    const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
+    request.systemInstruction = { parts: [{ text: [skillContext.skillPrompt, intelligentPrompt].filter(Boolean).join('\n\n') }] };
 
     // Add recent conversation history (excluding system messages) with validation
     const conversationContents = conversationHistory
@@ -788,11 +784,11 @@ Always respond to the point, do not repeat the question or unnecessary informati
     // Add programming language context if provided
     if (programmingLanguage) {
       const lang = String(programmingLanguage).toLowerCase();
-      const languageMap = { cpp: 'C++', c: 'C', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript' };
+      const languageMap = { cpp: 'C++', c: 'C', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript', go: 'Go' };
       const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
       const languageTitle = languageMap[lang] || (lang.charAt(0).toUpperCase() + lang.slice(1));
       const fenceTag = fenceTagMap[lang] || lang || 'text';
-      prompt += `\n\nCODING CONTEXT: Respond ONLY in ${languageTitle}. All code blocks must use triple backticks with language tag \`\`\`${fenceTag}\`\`\`. Do not include other languages unless explicitly asked.`;
+      prompt += `\n\nCODING CONTEXT: Use ${languageTitle} for application code. Preserve SQL, shell and configuration formats. Application code fences use language tag \`\`\`${fenceTag}\`\`\`. Do not include other languages unless explicitly asked.`;
     }
 
     prompt += `
@@ -839,6 +835,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   }
 
   async executeRequest(geminiRequest) {
+    if (this.provider !== 'gemini') return compatible.complete(geminiRequest);
     const maxRetries = config.get('llm.gemini.maxRetries');
     const timeout = config.get('llm.gemini.timeout');
     const primaryModel = this.model;
@@ -980,7 +977,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    */
   async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Configure the selected AI provider in Settings.');
     }
 
     const startTime = Date.now();
@@ -1054,6 +1051,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    * for each chunk.
    */
   async executeStreamingRequest(geminiRequest, onDelta) {
+    if (this.provider !== 'gemini') return compatible.complete(geminiRequest, onDelta);
     const maxRetries = config.get('llm.gemini.maxRetries');
     const apiKey = config.getApiKey('GEMINI');
     const primaryModel = this.model;
@@ -1394,6 +1392,14 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       return { success: false, error: 'Service not initialized' };
     }
 
+    if (this.provider !== 'gemini') {
+      try {
+        const start = Date.now();
+        const response = await compatible.complete({ contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }], generationConfig: { maxOutputTokens: 1024 } });
+        return { success: true, response, model: this.model, provider: this.provider, latency: Date.now() - start };
+      } catch (error) { return { success: false, error: error.message }; }
+    }
+
     try {
       // First check network connectivity
       const networkCheck = await this.checkNetworkConnectivity();
@@ -1519,6 +1525,8 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
 
   getStats() {
     return {
+      provider: this.provider,
+      model: this.model,
       isInitialized: this.isInitialized,
       requestCount: this.requestCount,
       errorCount: this.errorCount,
@@ -1532,6 +1540,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   }
 
   async executeAlternativeRequest(geminiRequest) {
+    if (this.provider !== 'gemini') return compatible.complete(geminiRequest);
     const https = require('https');
     const apiKey = config.getApiKey('GEMINI');
     const primaryModel = config.get('llm.gemini.model');

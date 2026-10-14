@@ -677,7 +677,7 @@
     <div class="chat-container" id="chatContainer">
       <div class="chat-header">
         <div class="header-title">
-          <i class="fas fa-microphone"></i>
+          <i class="fas fa-volume-up"></i>
           Live Transcription & Chat
           <div class="recording-indicator" id="recordingIndicator"></div>
         </div>
@@ -702,7 +702,7 @@
             rows="1"
           ></textarea>
           <button class="mic-button" id="micButton">
-            <i class="fas fa-microphone"></i>
+            <i class="fas fa-volume-up"></i>
           </button>
           <button class="send-button" id="sendButton">
             <i class="fas fa-paper-plane"></i>
@@ -746,6 +746,27 @@
       let chatHistory = [];
       const recentResponseHashes = new Set();
       const RECENT_HASH_LIMIT = 50;
+      const activeResponses = new Map();
+      const finishedResponseIds = new Set();
+      const responseSubscriptions = [];
+
+      function rememberFinishedResponse(messageId) {
+        finishedResponseIds.add(messageId);
+        if (finishedResponseIds.size > 500) finishedResponseIds.delete(finishedResponseIds.values().next().value);
+      }
+
+      function clearResponseStreams() {
+        for (const [id, state] of activeResponses) {
+          clearTimeout(state.timer);
+          rememberFinishedResponse(id);
+        }
+        activeResponses.clear();
+      }
+
+      window.addEventListener('beforeunload', () => {
+        clearResponseStreams();
+        responseSubscriptions.forEach(unsubscribe => unsubscribe());
+      });
 
       function hashString(str) {
         try {
@@ -795,6 +816,8 @@
           if (!ok) return;
         }
         chatHistory = [];
+        clearResponseStreams();
+        recentResponseHashes.clear();
         saveHistory();
         // Clear DOM
         if (chatMessages) chatMessages.innerHTML = '';
@@ -831,7 +854,7 @@
         whysperAPI.onLlmResponse((event, data) => {
           try { hideThinkingIndicator(); } catch (_) {}
           if (data && data.response) {
-            renderAssistantResponse(data.response);
+            renderAssistantResponse(data.response, data.messageId || data.metadata?.messageId);
           }
         });
       }
@@ -866,8 +889,7 @@
         
         // Format assistant messages as markdown
         if (type === 'assistant') {
-          textDiv.innerHTML = formatMarkdown(text);
-          if (window.renderMathInElement) window.renderMathInElement(textDiv);
+          renderResponseContent(textDiv, text);
         } else {
           textDiv.textContent = text;
         }
@@ -882,6 +904,7 @@
           chatHistory.push({ kind: 'message', type, text });
           saveHistory();
         }
+        return messageDiv;
       }
 
       // Markdown formatter using markdown.js library
@@ -893,7 +916,7 @@
             return markdown.toHTML(text);
           } else {
             console.warn('Markdown library not loaded, falling back to basic formatting');
-            return text
+            return escapeHtml(text)
               .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
               .replace(/\*(.+?)\*/g, '<em>$1</em>')
               .replace(/`(.+?)`/g, '<code>$1</code>')
@@ -901,12 +924,13 @@
           }
         } catch (error) {
           console.error('Markdown parsing failed:', error);
-          return text.replace(/\n/g, '<br>');
+          return escapeHtml(text).replace(/\n/g, '<br>');
         }
       }
 
       // Show thinking indicator
       function showThinkingIndicator() {
+        if (document.getElementById('thinking-indicator')) return;
         const thinkingDiv = document.createElement('div');
         thinkingDiv.className = 'message assistant thinking';
         thinkingDiv.id = 'thinking-indicator';
@@ -928,10 +952,30 @@
 
       // Hide thinking indicator
       function hideThinkingIndicator() {
-        const thinkingIndicator = document.getElementById('thinking-indicator');
-        if (thinkingIndicator) {
-          thinkingIndicator.remove();
-        }
+        document.querySelectorAll('#thinking-indicator').forEach(indicator => indicator.remove());
+      }
+
+      if (whysperAPI) {
+        const showRequestError = (_event, data) => {
+          const id = data?.messageId;
+          if (id && finishedResponseIds.has(id)) return;
+          hideThinkingIndicator();
+          const state = activeResponses.get(id);
+          if (state) {
+            clearTimeout(state.timer);
+            if (state.element && state.text) {
+              renderResponseContent(state.element.querySelector('.message-text'), state.text);
+              chatHistory.push({ kind: 'message', type: 'assistant', text: state.text });
+              saveHistory();
+            } else state.element?.remove();
+            activeResponses.delete(id);
+            rememberFinishedResponse(id);
+          }
+          if (id) rememberFinishedResponse(id);
+          addMessage(data?.error || 'AI request failed. Check provider settings.', 'error');
+        };
+        whysperAPI.onLlmError(showRequestError);
+        whysperAPI.onOcrError(showRequestError);
       }
 
       // Minimalist Listening Animation Functions
@@ -1013,15 +1057,8 @@
           // Hide listening animation first
           hideListeningAnimation();
 
-          // Show transcribed text with slight delay for smooth transition
-          setTimeout(() => {
-            addMessage(text.trim(), 'transcription');
-            
-            // Show thinking indicator after transcription
-            setTimeout(() => {
-              showThinkingIndicator();
-            }, 300);
-          }, 200);
+          addMessage(text.trim(), 'transcription');
+          showThinkingIndicator();
         } else {
           console.warn('Invalid or empty transcription text - ignoring:', text);
         }
@@ -1035,7 +1072,8 @@
         let match;
         while ((match = regex.exec(text)) !== null) {
           const info = (match[2] || '').trim();
-          const langToken = info.split(/\s+/)[0] || 'text';
+          const token = info.split(/\s+/)[0] || 'text';
+          const langToken = /^[\w+#.-]+$/.test(token) ? token : 'text';
           blocks.push({ language: langToken, code: match[3], fullMatch: match[0] });
         }
         return blocks;
@@ -1127,8 +1165,69 @@
           saveHistory();
         }
       }
-      function renderAssistantResponse(response) {
+      // Keep partial text literal: incomplete Markdown/code fences are common
+      // during generation. Format Markdown and add copy buttons once complete.
+      function renderResponseContent(container, response) {
+        const blocks = extractCodeBlocks(response);
+        container.style.whiteSpace = '';
+        container.innerHTML = formatMarkdown(stripCodeBlocks(response, blocks));
+        if (window.renderMathInElement) window.renderMathInElement(container);
+        for (const block of blocks) {
+          const pre = document.createElement('pre');
+          const code = document.createElement('code');
+          code.className = `language-${block.language.toLowerCase()}`;
+          code.textContent = block.code;
+          const button = document.createElement('button');
+          button.className = 'copy-btn';
+          button.textContent = 'Copy';
+          attachCopy(button, block.code);
+          pre.append(button, code);
+          container.appendChild(pre);
+          if (window.Prism?.highlightElement) Prism.highlightElement(code);
+        }
+      }
+
+      if (whysperAPI) {
+        responseSubscriptions.push(whysperAPI.onTranscriptionLlmResponseStart((_event, data) => {
+          if (!data?.messageId || finishedResponseIds.has(data.messageId) || activeResponses.has(data.messageId)) return;
+          activeResponses.set(data.messageId, { text: '', element: null, timer: 0 });
+          showThinkingIndicator();
+        }));
+        responseSubscriptions.push(whysperAPI.onTranscriptionLlmResponseChunk((_event, data) => {
+          const state = activeResponses.get(data?.messageId);
+          if (!state || typeof data.delta !== 'string' || !data.delta) return;
+          hideThinkingIndicator();
+          state.text += data.delta;
+          if (!state.element) {
+            state.element = addMessage('', 'assistant', true);
+            state.element.dataset.messageId = data.messageId;
+          }
+          if (!state.timer) state.timer = setTimeout(() => {
+            state.timer = 0;
+            const content = state.element.querySelector('.message-text');
+            content.style.whiteSpace = 'pre-wrap';
+            content.textContent = state.text;
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+          }, 30);
+        }));
+      }
+
+      function renderAssistantResponse(response, messageId) {
         if (!response || typeof response !== 'string') return;
+        if (messageId) {
+          if (finishedResponseIds.has(messageId)) return;
+          const state = activeResponses.get(messageId);
+          if (state) clearTimeout(state.timer);
+          const element = state?.element || addMessage('', 'assistant', true);
+          element.dataset.messageId = messageId;
+          renderResponseContent(element.querySelector('.message-text'), response);
+          activeResponses.delete(messageId);
+          rememberFinishedResponse(messageId);
+          chatHistory.push({ kind: 'message', type: 'assistant', text: response });
+          saveHistory();
+          chatMessages.scrollTop = chatMessages.scrollHeight;
+          return;
+        }
         // Deduplication: avoid processing the same response twice
         const normalized = response.trim();
         const h = hashString(normalized);
@@ -1205,7 +1304,7 @@
         whysperAPI.onTranscriptionLlmResponse((event, data) => {
           if (data && data.response) {
             try { hideThinkingIndicator(); } catch (_) {}
-            renderAssistantResponse(data.response);
+            renderAssistantResponse(data.response, data.messageId || data.metadata?.messageId);
           }
         });
       }
@@ -1250,9 +1349,7 @@
             messageInput.value = '';
             
             // Show thinking indicator after user message
-            setTimeout(() => {
-              showThinkingIndicator();
-            }, 300);
+            showThinkingIndicator();
             
             // Send to main process for session memory storage and LLM processing
             try {
@@ -1261,6 +1358,8 @@
               }
             } catch (error) {
               console.error('Failed to send chat message to main process:', error);
+              hideThinkingIndicator();
+              addMessage(error.message || 'Failed to send message', 'error');
             }
           }
         });
@@ -1288,13 +1387,15 @@
               addMessage(text, 'user');
               messageInput.value = '';
               autoGrow(messageInput);
-              setTimeout(() => { showThinkingIndicator(); }, 300);
+              showThinkingIndicator();
               try {
                 if (whysperAPI && whysperAPI.sendChatMessage) {
                   await whysperAPI.sendChatMessage(text);
                 }
               } catch (error) {
                 console.error('Failed to send chat message to main process:', error);
+                hideThinkingIndicator();
+                addMessage(error.message || 'Failed to send message', 'error');
               }
             }
           }

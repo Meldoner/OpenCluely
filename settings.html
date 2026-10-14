@@ -309,6 +309,7 @@
                             <option value="python">Python</option>
                             <option value="java">Java</option>
                             <option value="javascript">JavaScript</option>
+                            <option value="go">Go</option>
                         </select>
                     </div>
                     <div class="settings-item">
@@ -317,8 +318,13 @@
                             <div class="settings-item-description">Choose your current focus area</div>
                         </div>
                         <select class="input-field" id="activeSkill">
-                            <option value="dsa">Data Structures & Algorithms</option>
-                        </select>
+<option value="dsa">DSA</option>
+<option value="devops">DevOps</option>
+<option value="analyst">Аналитик</option>
+<option value="backend">Backend dev</option>
+<option value="ml-engineer">ML Engineer</option>
+<option value="ai-engineer">AI Engineer</option>
+</select>
                     </div>
                 </div>
             </div>
@@ -355,14 +361,25 @@
                     <div class="settings-item">
                         <div>
                             <div class="settings-item-label">Speech Provider</div>
-                            <div class="settings-item-description">Choose Azure Speech or a local OpenAI Whisper CLI</div>
+                            <div class="settings-item-description">Choose Azure Speech, local Whisper or Cloudflare Whisper</div>
                         </div>
                         <select class="input-field" id="speechProvider">
                             <option value="azure">Azure Speech</option>
                             <option value="whisper">Local Whisper</option>
+                            <option value="cloudflare">Cloudflare Whisper</option>
+                            <option value="disabled">Disabled</option>
                         </select>
                     </div>
 
+                    <div class="settings-note">Audio source: computer output. Windows uses system loopback; Linux uses the default output monitor. macOS requires a routed virtual loopback device.</div>
+                    <div class="settings-item">
+                        <div><div class="settings-item-label">macOS loopback device name</div><div class="settings-item-description">Exact input label, e.g. BlackHole 2ch. Route computer output to this virtual device.</div></div>
+                        <input class="input-field" id="systemAudioDevice" placeholder="BlackHole 2ch">
+                    </div>
+                    <div id="cloudflareSpeechFields" class="settings-item">
+                        <div><div class="settings-item-label">Cloudflare Whisper model</div><div class="settings-item-description">Uses the Account ID and API Token in AI Providers below</div></div>
+                        <select class="input-field" id="cloudflareWhisperModel"><option value="@cf/openai/whisper">Whisper</option><option value="@cf/openai/whisper-large-v3-turbo">Whisper Large v3 Turbo</option></select>
+                    </div>
                     <!-- Azure fields (shown only when Azure is selected) -->
                     <div id="azureFields" class="settings-group">
                         <div class="settings-item">
@@ -402,7 +419,7 @@
                         <div class="settings-item">
                             <div>
                                 <div class="settings-item-label">Whisper Language</div>
-                                <div class="settings-item-description">Language code or auto-detection for local transcription</div>
+                                <div class="settings-item-description">Use auto or a language code such as ru (Russian). Cloudflare Turbo accepts an explicit language; standard Cloudflare Whisper detects it automatically.</div>
                             </div>
                             <input type="text" class="input-field" id="whisperLanguage" placeholder="auto">
                         </div>
@@ -457,21 +474,10 @@
             </div>
             
             <div class="settings-section">
-                <div class="settings-section-title">
-                    <i class="fas fa-robot"></i>
-                    Gemini Settings
-                </div>
-                <div class="settings-section-content">
-                    <div class="settings-item">
-                        <div>
-                            <div class="settings-item-label">Google API Key</div>
-                            <div class="settings-item-description">Your Google API key for Gemini models</div>
-                        </div>
-                        <input type="password" class="input-field" id="geminiKey" placeholder="Enter your Google API key">
-                    </div>
-                </div>
+                <div class="settings-section-title"><i class="fas fa-robot"></i> AI Providers</div>
+                <div class="settings-section-content" id="aiProviderSettings"></div>
             </div>
-            
+
             <div class="settings-section">
                 <div class="settings-section-title">
                     <i class="fas fa-window-maximize"></i>
@@ -490,6 +496,7 @@
         </div>
     </div>
 
+    <script src="./src/ui/provider-settings.js"></script>
     <script src="./src/ui/settings-window.js"></script>
 </body>
 </html>

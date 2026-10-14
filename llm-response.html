@@ -475,6 +475,51 @@
         let isInteractive = false;
         let scrollableElements = [];
         let initialized = false;
+        let activeResponse = null;
+        let responseTimer = 0;
+        const finishedResponseIds = new Set();
+        const responseSubscriptions = [];
+
+        function rememberFinishedResponse(id) {
+            if (!id) return;
+            finishedResponseIds.add(id);
+            if (finishedResponseIds.size > 500) finishedResponseIds.delete(finishedResponseIds.values().next().value);
+        }
+
+        function stopResponseStream() {
+            clearTimeout(responseTimer);
+            responseTimer = 0;
+            if (activeResponse) rememberFinishedResponse(activeResponse.messageId);
+            activeResponse = null;
+        }
+
+        window.addEventListener('beforeunload', () => {
+            stopResponseStream();
+            responseSubscriptions.forEach(unsubscribe => unsubscribe());
+        });
+
+        function displayStreamingText(text) {
+            hideLoadingState();
+            hasCode = false;
+            document.getElementById('response-content').classList.remove('hidden');
+            document.getElementById('split-layout').classList.add('hidden');
+            document.getElementById('full-content').classList.remove('hidden');
+            const full = document.getElementById('full-markdown');
+            full.style.whiteSpace = 'pre-wrap';
+            full.textContent = text;
+        }
+
+        function finishResponse(data) {
+            const id = data?.messageId || data?.metadata?.messageId;
+            if (id && finishedResponseIds.has(id)) return;
+            if (!(data?.content || data?.response)) return;
+            stopResponseStream();
+            rememberFinishedResponse(id);
+            document.getElementById('full-markdown').style.whiteSpace = '';
+            hideLoadingState();
+            displayResponse(data);
+            setupScrolling();
+        }
         
         // Immediate logging to verify script execution
         console.log('[LLM-RESPONSE] Script tag executed');
@@ -526,6 +571,36 @@
             // Set up event listeners using electronAPI from preload script
             if (window.electronAPI) {
                 console.log('[LLM-RESPONSE] Setting up IPC listeners...');
+
+                responseSubscriptions.push(window.electronAPI.onTranscriptionLlmResponseStart((_event, data) => {
+                    if (!data?.messageId || finishedResponseIds.has(data.messageId) || activeResponse?.messageId === data.messageId) return;
+                    stopResponseStream();
+                    activeResponse = { messageId: data.messageId, text: '' };
+                    showLoadingState();
+                }));
+                responseSubscriptions.push(window.electronAPI.onTranscriptionLlmResponseChunk((_event, data) => {
+                    if (!activeResponse || activeResponse.messageId !== data?.messageId || typeof data.delta !== 'string' || !data.delta) return;
+                    activeResponse.text += data.delta;
+                    if (!responseTimer) responseTimer = setTimeout(() => {
+                        responseTimer = 0;
+                        if (activeResponse) displayStreamingText(activeResponse.text);
+                    }, 30);
+                }));
+                window.electronAPI.onTranscriptionLlmResponse((_event, data) => finishResponse(data));
+                const showResponseError = (_event, data) => {
+                    if (data?.messageId && finishedResponseIds.has(data.messageId)) return;
+                    if (data?.messageId && activeResponse?.messageId !== data.messageId) return;
+                    const partial = activeResponse?.text || '';
+                    stopResponseStream();
+                    rememberFinishedResponse(data?.messageId);
+                    displayStreamingText([partial, data?.error || 'AI request failed.'].filter(Boolean).join('\n\n'));
+                };
+                window.electronAPI.onLlmError(showResponseError);
+                window.electronAPI.onOcrError(showResponseError);
+                window.electronAPI.onSessionCleared(() => {
+                    stopResponseStream();
+                    displayStreamingText('');
+                });
                 
                 // Set up show-loading event listener
                 window.electronAPI.onShowLoading(() => {
@@ -558,10 +633,7 @@
                             return;
                         }
                         
-                        hideLoadingState();
-                        displayResponse(actualData);
-                        setupScrolling();
-                        setTimeout(verifyDisplayState, 500);
+                        finishResponse(actualData);
                         console.log('[LLM-RESPONSE] Handler completed successfully');
                     } catch (err) {
                         console.error('[LLM-RESPONSE] Error in handler:', err.message, err.stack);
@@ -763,7 +835,8 @@
             let match;
             while ((match = regex.exec(text)) !== null) {
                 const info = (match[2] || '').trim();
-                const langToken = info.split(/\s+/)[0] || 'text';
+                const token = info.split(/\s+/)[0] || 'text';
+                const langToken = /^[\w+#.-]+$/.test(token) ? token : 'text';
                 blocks.push({ language: langToken, code: match[3], fullMatch: match[0] });
             }
             return blocks;

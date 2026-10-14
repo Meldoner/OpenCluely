@@ -1,5 +1,11 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
+function subscribeResponseEvent(channel, callback) {
+  const listener = (_event, data) => callback(null, data);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -11,6 +17,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopSpeechRecognition: () => ipcRenderer.invoke('stop-speech-recognition'),
   sendAudioChunk: (buffer) => ipcRenderer.send('audio-chunk', { buffer }),
   getSpeechAvailability: () => ipcRenderer.invoke('get-speech-availability'),
+  getAudioCaptureSettings: () => ipcRenderer.invoke('get-audio-capture-settings'),
+  reportAudioCaptureError: (message) => ipcRenderer.send('audio-capture-error', String(message)),
+  getAvailableSkills: () => ipcRenderer.invoke('get-available-skills'),
+  testLlmConnection: () => ipcRenderer.invoke('test-llm-connection'),
   
   // Window management
   showAllWindows: () => ipcRenderer.invoke('show-all-windows'),
@@ -107,8 +117,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onLlmResponse: (callback) => ipcRenderer.on('llm-response', callback),
   onLlmError: (callback) => ipcRenderer.on('llm-error', callback),
   onTranscriptionLlmResponse: (callback) => ipcRenderer.on('transcription-llm-response', callback),
-  onTranscriptionLlmResponseStart: (callback) => ipcRenderer.on('transcription-llm-response-start', callback),
-  onTranscriptionLlmResponseChunk: (callback) => ipcRenderer.on('transcription-llm-response-chunk', callback),
+  onTranscriptionLlmResponseStart: (callback) => subscribeResponseEvent('transcription-llm-response-start', callback),
+  onTranscriptionLlmResponseChunk: (callback) => subscribeResponseEvent('transcription-llm-response-chunk', callback),
   onOpenGeminiConfig: (callback) => ipcRenderer.on('open-gemini-config', callback),
   onDisplayLlmResponse: (callback) => ipcRenderer.on('display-llm-response', callback),
   onShowLoading: (callback) => ipcRenderer.on('show-loading', callback),

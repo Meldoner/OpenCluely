@@ -387,19 +387,14 @@ const { EventEmitter } = require('events');
 const logger = require('../core/logger').createServiceLogger('SPEECH');
 const config = require('../core/config');
 const WhisperWorkerService = require('./whisper-worker.service');
+const cloudflareSpeech = require('./cloudflare-speech.service');
+const { startNativeCapture } = require('./system-audio.service');
 
 let sdk = null;
 try {
   sdk = require('microsoft-cognitiveservices-speech-sdk');
 } catch (error) {
   logger.warn('Azure Speech SDK unavailable', { error: error.message });
-}
-
-let recorder = null;
-try {
-  recorder = require('node-record-lpcm16');
-} catch (error) {
-  logger.warn('Local audio recorder dependency unavailable', { error: error.message });
 }
 
 class SpeechService extends EventEmitter {
@@ -453,7 +448,13 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    const reason = 'Speech recognition disabled. Configure Azure or local Whisper.';
+    if (provider === 'cloudflare') {
+      this.available = cloudflareSpeech.isConfigured();
+      this.emit('status', this.available ? 'Cloudflare Whisper ready' : 'Configure Cloudflare Account ID and API Token');
+      return;
+    }
+
+    const reason = 'Speech recognition disabled. Configure local Whisper, Cloudflare Whisper or Azure.';
     logger.warn(reason);
     this.emit('status', reason);
   }
@@ -462,10 +463,6 @@ class SpeechService extends EventEmitter {
     try {
       if (!sdk) {
         throw new Error('Azure Speech SDK dependency is not installed');
-      }
-
-      if (!recorder || typeof recorder.record !== 'function') {
-        throw new Error('Local microphone recorder dependency is not installed');
       }
 
       const subscriptionKey = this._getSetting('azureKey') || process.env.AZURE_SPEECH_KEY;
@@ -566,7 +563,7 @@ class SpeechService extends EventEmitter {
         return;
       }
 
-      if (this.provider === 'whisper') {
+      if (this._isWhisperProvider()) {
         this._startWhisperRecording();
         return;
       }
@@ -584,20 +581,20 @@ class SpeechService extends EventEmitter {
       throw new Error('Azure Speech client not initialized');
     }
 
-    this.isRecording = true;
-    this.emit('recording-started');
-    this.emit('status', 'Azure recording started');
     this._cleanup();
+    this.isRecording = true;
 
     try {
       this.pushStream = sdk.AudioInputStream.createPushStream();
       this.audioConfig = sdk.AudioConfig.fromStreamInput(this.pushStream);
-      this._startMicrophoneCapture();
       this.recognizer = new sdk.SpeechRecognizer(this.speechConfig, this.audioConfig);
+      this._startSystemAudioCapture();
+      this.emit('status', 'Azure system audio recording started');
     } catch (error) {
       logger.error('Failed to start Azure recording session', { error: error.message });
       this.emit('error', `Audio configuration failed: ${error.message}`);
       this.isRecording = false;
+      this._finalizeStop('Recording stopped');
       return;
     }
 
@@ -637,7 +634,7 @@ class SpeechService extends EventEmitter {
         } else if (details.includes('Forbidden')) {
           this.emit('error', 'Access denied. Please check your Azure Speech service subscription and region.');
         } else if (details.includes('AudioInputMicrophone_InitializationFailure')) {
-          this.emit('error', 'Microphone initialization failed. Please check microphone permissions and availability.');
+          this.emit('error', 'System audio initialization failed. Check output capture and permissions.');
         } else {
           this.emit('error', `Recognition error: ${details}`);
         }
@@ -670,7 +667,7 @@ class SpeechService extends EventEmitter {
         logger.error('Failed to start continuous recognition', { error: error.toString() });
         this.emit('error', `Recognition startup failed: ${error}`);
         this.isRecording = false;
-        this._cleanup();
+        this._finalizeStop('Recording stopped');
       }
     );
   }
@@ -685,10 +682,9 @@ class SpeechService extends EventEmitter {
     this.pendingFinal = false;
     this.manualStopRequested = false;
     this._resetVadState();
-    this.emit('recording-started');
-    this.emit('status', 'Local Whisper recording started');
+    this.emit('status', `${this.provider === 'cloudflare' ? 'Cloudflare' : 'Local'} Whisper system audio recording started`);
 
-    if (this.whisperWorker.isConfigured()) {
+    if (this.provider === 'whisper' && this.whisperWorker.isConfigured()) {
       this.whisperWorker.warmup({
         model: this._getWhisperModel(),
         modelDir: this._getWhisperModelDir(),
@@ -706,23 +702,7 @@ class SpeechService extends EventEmitter {
       });
     }
 
-    // Capture microphone audio in the renderer via the Web Audio API on Windows
-    // and macOS. Windows lacks the Unix sox/rec/arecord tools node-record-lpcm16
-    // needs; macOS would otherwise require a Homebrew `sox` install (not bundled)
-    // and a child-process mic that the system TCC prompt can't attribute. The
-    // renderer path uses getUserMedia, which macOS prompts for cleanly via the
-    // app's NSMicrophoneUsageDescription. Linux keeps the native recorder path.
-    this.useRendererCapture = process.platform === 'win32' || process.platform === 'darwin';
-    if (this.useRendererCapture) {
-      this.emit('status', 'Waiting for microphone audio…');
-      // The renderer starts sending chunks once it receives the recording-started event.
-      if (!this._isManualCaptureMode()) {
-        this._startSegmentWatchdog();
-      }
-      return;
-    }
-
-    this._startMicrophoneCapture();
+    this._startSystemAudioCapture();
     if (!this._isManualCaptureMode()) {
       this._startSegmentWatchdog();
     }
@@ -748,6 +728,21 @@ class SpeechService extends EventEmitter {
     this.vadLastChunkAt = 0;         // timestamp of the last ingested chunk
   }
 
+  _isWhisperProvider() {
+    return this.provider === 'whisper' || this.provider === 'cloudflare';
+  }
+
+  _startSystemAudioCapture() {
+    this.useRendererCapture = process.platform === 'win32' || process.platform === 'darwin';
+    if (!this.useRendererCapture) {
+      this.recording = startNativeCapture(chunk => this._handleAudioChunk(chunk), error => {
+        this.emit('error', error.message);
+        this.stopRecording();
+      });
+    }
+    this.emit('recording-started');
+  }
+
   /**
    * Lightweight watchdog. Silence is normally detected from incoming chunks
    * (which keep flowing at low energy), but if the capture pipeline stalls
@@ -759,7 +754,7 @@ class SpeechService extends EventEmitter {
       clearInterval(this.segmentTimer);
     }
     this.segmentTimer = setInterval(() => {
-      if (!this.isRecording || this.provider !== 'whisper') {
+      if (!this.isRecording || !this._isWhisperProvider()) {
         return;
       }
 
@@ -788,14 +783,14 @@ class SpeechService extends EventEmitter {
    * the current Whisper segment buffer.
    */
   handleAudioChunkFromRenderer(chunk) {
-    if (!this.isRecording || this.provider !== 'whisper' || !this.useRendererCapture) {
+    if (!this.isRecording || !this.useRendererCapture) {
       return;
     }
     if (!chunk || !chunk.length) {
       return;
     }
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    this._ingestWhisperAudio(buffer);
+    this._handleAudioChunk(buffer);
   }
 
   /**
@@ -936,6 +931,8 @@ class SpeechService extends EventEmitter {
     this.vadPreRollMs = 0;
     this._flushWhisperSegment({ final: false }).catch((error) => {
       logger.error('Whisper segment transcription failed', { error: error.message });
+      this.emit('error', `Transcription failed: ${error.message}`);
+      this.stopRecording();
     });
   }
 
@@ -957,6 +954,8 @@ class SpeechService extends EventEmitter {
     });
 
     if (this.provider === 'azure' && this.recognizer) {
+      this.isProcessingAudio = true;
+      this.emit('recording-stopped');
       try {
         this.recognizer.stopContinuousRecognitionAsync(
           () => {
@@ -974,10 +973,10 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    if (this.provider === 'whisper') {
+    if (this._isWhisperProvider()) {
       this.isProcessingAudio = true;
       this.emit('recording-stopped');
-      this.emit('status', 'Processing local speech…');
+      this.emit('status', 'Processing system audio…');
       this._finalizeWhisperStop({ captureAlreadyStopped: true });
       return;
     }
@@ -1017,6 +1016,8 @@ class SpeechService extends EventEmitter {
   }
 
   _finalizeStop(statusMessage) {
+    this.isRecording = false;
+    this.isProcessingAudio = false;
     this._cleanup();
     this.emit('recording-stopped');
     this.emit('status', statusMessage);
@@ -1110,21 +1111,29 @@ class SpeechService extends EventEmitter {
     if (this.provider === 'whisper') {
       return this._transcribeWhisperFile(audioFilePath);
     }
+    if (this.provider === 'cloudflare') {
+      return cloudflareSpeech.transcribe(fs.readFileSync(audioFilePath), this._getWhisperLanguage());
+    }
 
     throw new Error('Speech service not initialized');
   }
 
   async testConnection() {
+    if (this.provider === 'cloudflare') {
+      return { success: cloudflareSpeech.isConfigured(), message: 'Cloudflare configuration check (no audio uploaded)' };
+    }
     if (this.provider === 'azure') {
       if (!this.speechConfig) {
         throw new Error('Speech service not initialized');
       }
 
       try {
-        const audioConfig = sdk.AudioConfig.fromDefaultMicrophoneInput();
+        const stream = sdk.AudioInputStream.createPushStream();
+        const audioConfig = sdk.AudioConfig.fromStreamInput(stream);
         const recognizer = new sdk.SpeechRecognizer(this.speechConfig, audioConfig);
         recognizer.close();
         audioConfig.close();
+        stream.close();
         return { success: true, message: 'Azure connection test successful' };
       } catch (error) {
         return { success: false, message: error.message };
@@ -1162,12 +1171,11 @@ class SpeechService extends EventEmitter {
       provider: this.provider,
       isRecording: this.isRecording,
       isProcessingAudio: this.isProcessingAudio,
-      isInitialized: this.provider === 'azure' ? !!this.speechConfig : !!this.whisperCommand,
+      isInitialized: this.provider === 'azure' ? !!this.speechConfig : this.isAvailable(),
       sessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0,
       retryCount: this.retryCount,
       effectiveSettings: {
         speechProvider: this.provider,
-        azureKey: this._getSetting('azureKey') || '',
         azureRegion: this._getSetting('azureRegion') || process.env.AZURE_SPEECH_REGION || '',
         whisperCommand: this._getSetting('whisperCommand') || process.env.WHISPER_COMMAND || '',
         whisperModelDir: this._getWhisperModelDir(),
@@ -1186,6 +1194,7 @@ class SpeechService extends EventEmitter {
   }
 
   isAvailable() {
+    if (this.provider === 'cloudflare') return this.available && cloudflareSpeech.isConfigured();
     if (this.provider === 'azure') {
       return !!this.speechConfig && !!this.available;
     }
@@ -1198,7 +1207,7 @@ class SpeechService extends EventEmitter {
   }
 
   isManualCaptureMode() {
-    return this.provider === 'whisper' && this._getWhisperCaptureMode() === 'manual';
+    return this._isWhisperProvider() && this._getWhisperCaptureMode() === 'manual';
   }
 
   shutdown() {
@@ -1229,7 +1238,7 @@ class SpeechService extends EventEmitter {
   _getConfiguredProvider() {
     const provider = String(this._getSetting('speechProvider') || process.env.SPEECH_PROVIDER || '').trim().toLowerCase();
 
-    if (provider === 'azure' || provider === 'whisper') {
+    if (['azure', 'whisper', 'cloudflare', 'disabled'].includes(provider)) {
       return provider;
     }
 
@@ -1662,131 +1671,6 @@ class SpeechService extends EventEmitter {
     };
   }
 
-  _startMicrophoneCapture() {
-    if (!recorder || typeof recorder.record !== 'function') {
-      this.emit('error', 'Local microphone capture dependency is missing. Run npm install to restore speech recording support.');
-      return;
-    }
-
-    // node-record-lpcm16 only ships two recorder modules: `sox` and `arecord`.
-    // `recorder` is the option it actually reads (the old `recordProgram` name
-    // was silently ignored, so every attempt fell back to sox). Each entry maps
-    // the recorder module to the binary we must verify is on PATH.
-    //   - macOS: sox (via Homebrew)
-    //   - Linux: arecord (ALSA, usually preinstalled) then sox
-    const candidates = process.platform === 'darwin'
-      ? [{ recorder: 'sox', bin: 'sox' }]
-      : [{ recorder: 'arecord', bin: 'arecord' }, { recorder: 'sox', bin: 'sox' }];
-    this._startMicrophoneCaptureWithFallback(candidates);
-  }
-
-  /**
-   * Whether an audio capture binary is on PATH. node-record-lpcm16 spawns
-   * these directly and, when the binary is missing, emits an `error` on its
-   * child process with no listener — which would otherwise crash the whole
-   * app. We pre-filter to binaries that exist so the library never receives a
-   * missing program.
-   */
-  _audioProgramExists(bin) {
-    try {
-      const r = spawnSync(
-        process.platform === 'win32' ? 'where' : 'which',
-        [bin],
-        { windowsHide: true, timeout: 4000 }
-      );
-      return r.status === 0;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  _startMicrophoneCaptureWithFallback(candidates) {
-    const available = candidates.filter((c) => this._audioProgramExists(c.bin));
-
-    if (available.length === 0) {
-      const hint = process.platform === 'darwin'
-        ? 'Install one with `brew install sox`.'
-        : process.platform === 'linux'
-          ? 'Install one with `sudo apt install alsa-utils` (arecord) or `sudo apt install sox`.'
-          : 'No supported microphone capture tool was found.';
-      logger.warn('No audio capture program available', {
-        tried: candidates.map((c) => c.bin),
-        platform: process.platform,
-      });
-      this.isRecording = false;
-      this.emit('error', `Microphone capture needs sox or arecord, but none was found. ${hint}`);
-      return;
-    }
-
-    const queue = [...available];
-
-    const tryNextProgram = () => {
-      const candidate = queue.shift();
-      if (!candidate) {
-        this.isRecording = false;
-        this.emit('error', 'Could not start microphone capture with any available audio program');
-        return;
-      }
-
-      const program = candidate.bin;
-      try {
-        this.recording = recorder.record({
-          sampleRate: 16000,
-          sampleRateHertz: 16000,
-          channels: 1,
-          threshold: 0,
-          verbose: false,
-          recorder: candidate.recorder,
-          silence: '10.0s'
-        });
-
-        const stream = this.recording.stream();
-        this.audioProgram = program;
-
-        // Guard the spawned child process directly. A spawn failure (e.g. the
-        // binary disappeared between our probe and the spawn, or a permission
-        // error) emits `error` on the child, which node-record-lpcm16 leaves
-        // unhandled — fatal without this listener.
-        const child = this.recording.process;
-        if (child && typeof child.on === 'function') {
-          child.on('error', (error) => {
-            logger.error('Audio recording process error', { error: error.message, program });
-            if (this.recording) {
-              try { this.recording.stop(); } catch (_) { /* ignore */ }
-              this.recording = null;
-            }
-            if (this.isRecording) tryNextProgram();
-          });
-        }
-
-        stream.on('error', (error) => {
-          logger.error('Audio recording stream error', { error: error.message, program });
-          if (this.recording) {
-            try {
-              this.recording.stop();
-            } catch (stopError) {
-              logger.error('Error stopping failed recording program', { error: stopError.message });
-            }
-            this.recording = null;
-          }
-
-          if (this.isRecording) {
-            tryNextProgram();
-          }
-        });
-
-        stream.on('data', (chunk) => {
-          this._handleAudioChunk(chunk);
-        });
-      } catch (error) {
-        logger.error('Failed to start microphone capture program', { program, error: error.message });
-        tryNextProgram();
-      }
-    };
-
-    tryNextProgram();
-  }
-
   _handleAudioChunk(chunk) {
     if (!chunk || !chunk.length || !this.isRecording) {
       return;
@@ -1801,53 +1685,37 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    if (this.provider === 'whisper') {
+    if (this._isWhisperProvider()) {
       this._ingestWhisperAudio(Buffer.from(chunk));
     }
   }
 
   async _flushWhisperSegment({ final }) {
     if (this.transcriptionInFlight) {
-      // A flush was requested while a transcription is still running. Record
-      // that we owe a follow-up flush for ANY request (not just a final one),
-      // otherwise an utterance that ended mid-transcription stays stranded in
-      // the buffer until the next utterance ends or the session stops. Track
-      // final-ness separately so a queued stop still finalises correctly.
       this.pendingFlush = true;
-      if (final) {
-        this.pendingFinal = true;
-      }
-      return;
+      this.pendingFinal = this.pendingFinal || final;
+      return this.transcriptionTask;
     }
-
-    if (!this.segmentBytes) {
-      return;
-    }
-
+    if (!this.segmentBytes) return;
     const audioBuffer = Buffer.concat(this.segmentBuffers, this.segmentBytes);
     this.segmentBuffers = [];
     this.segmentBytes = 0;
-
     this.transcriptionInFlight = true;
-
-    try {
-      const transcript = await this._transcribeWhisperBuffer(audioBuffer);
-      const clean = transcript ? transcript.trim() : '';
-      if (clean && !this._isHallucinatedTranscript(clean)) {
-        this.emit('transcription', clean);
-      } else if (clean) {
-        logger.debug('Dropped likely Whisper silence hallucination', { transcript: clean });
+    this.transcriptionTask = (async () => {
+      try {
+        const transcript = await this._transcribeWhisperBuffer(audioBuffer);
+        const clean = transcript ? transcript.trim() : '';
+        if (clean && !this._isHallucinatedTranscript(clean)) this.emit('transcription', clean);
+      } finally {
+        this.transcriptionInFlight = false;
+        if (this.pendingFlush) {
+          const runFinal = this.pendingFinal;
+          this.pendingFlush = this.pendingFinal = false;
+          await this._flushWhisperSegment({ final: runFinal });
+        }
       }
-    } finally {
-      this.transcriptionInFlight = false;
-
-      if (this.pendingFlush) {
-        this.pendingFlush = false;
-        const runFinal = this.pendingFinal;
-        this.pendingFinal = false;
-        await this._flushWhisperSegment({ final: runFinal });
-      }
-    }
+    })();
+    return this.transcriptionTask;
   }
 
   /**
@@ -1881,6 +1749,9 @@ class SpeechService extends EventEmitter {
   }
 
   async _transcribeWhisperBuffer(audioBuffer) {
+    if (this.provider === 'cloudflare') {
+      return cloudflareSpeech.transcribe(this._createWavBuffer(audioBuffer), this._getWhisperLanguage());
+    }
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-'));
     const audioFilePath = path.join(tempDir, 'segment.wav');
 

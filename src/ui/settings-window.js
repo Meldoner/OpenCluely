@@ -3,6 +3,10 @@ document.addEventListener('DOMContentLoaded', () => {
         info: (...args) => console.log('[SettingsWindowUI]', ...args)
     };
 
+    const providerUI = new ProviderSettings(document.getElementById('aiProviderSettings'));
+    const cloudflareWhisperInput = document.getElementById('cloudflareWhisperModel');
+    const systemAudioDeviceInput = document.getElementById('systemAudioDevice');
+
     // Get DOM elements
     const closeButton = document.getElementById('closeButton');
     const quitButton = document.getElementById('quitButton');
@@ -16,7 +20,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const whisperCaptureModeSelect = document.getElementById('whisperCaptureMode');
     const whisperResponseTargetSelect = document.getElementById('whisperResponseTarget');
     const whisperSegmentMsInput = document.getElementById('whisperSegmentMs');
-    const geminiKeyInput = document.getElementById('geminiKey');
     const windowGapInput = document.getElementById('windowGap');
     const codingLanguageSelect = document.getElementById('codingLanguage');
     const activeSkillSelect = document.getElementById('activeSkill');
@@ -74,6 +77,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Function to load settings into UI
     const loadSettingsIntoUI = (settings) => {
+        providerUI.load(settings);
+        if (cloudflareWhisperInput) cloudflareWhisperInput.value = settings.cloudflareWhisperModel || "@cf/openai/whisper";
+        if (systemAudioDeviceInput) systemAudioDeviceInput.value = settings.systemAudioDevice || "";
         if (settings.speechProvider && speechProviderSelect) speechProviderSelect.value = settings.speechProvider;
         // Always set the input value, even if empty, so the user sees what's
         // currently configured (including env-derived defaults). Previously
@@ -87,7 +93,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCaptureModeSelect) whisperCaptureModeSelect.value = settings.whisperCaptureMode || 'vad';
         if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
-        if (geminiKeyInput) geminiKeyInput.value = settings.geminiKey || '';
         if (windowGapInput) windowGapInput.value = settings.windowGap || '';
 
         // Set C++ as default if no coding language is specified
@@ -134,8 +139,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Save settings helper function
-    const saveSettings = () => {
-        const settings = {};
+    const saveSettings = async () => {
+        const settings = providerUI.values();
+        if (cloudflareWhisperInput) settings.cloudflareWhisperModel = cloudflareWhisperInput.value;
+        if (systemAudioDeviceInput) settings.systemAudioDevice = systemAudioDeviceInput.value;
         if (speechProviderSelect) settings.speechProvider = speechProviderSelect.value;
         if (azureKeyInput) settings.azureKey = azureKeyInput.value;
         if (azureRegionInput) settings.azureRegion = azureRegionInput.value;
@@ -146,16 +153,20 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCaptureModeSelect) settings.whisperCaptureMode = whisperCaptureModeSelect.value;
         if (whisperResponseTargetSelect) settings.whisperResponseTarget = whisperResponseTargetSelect.value;
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
-        if (geminiKeyInput) settings.geminiKey = geminiKeyInput.value;
         if (windowGapInput) settings.windowGap = windowGapInput.value;
         if (codingLanguageSelect) settings.codingLanguage = codingLanguageSelect.value;
         if (activeSkillSelect) settings.activeSkill = activeSkillSelect.value;
         
-        window.api.send('save-settings', settings);
+        try {
+            const result = await window.electronAPI.saveSettings(settings);
+            if (!result.success) providerUI.status.textContent = result.error;
+        } catch (error) { providerUI.status.textContent = error.message; }
     };
 
     const updateSpeechFieldStates = () => {
-        const provider = speechProviderSelect ? speechProviderSelect.value : 'azure';
+        const provider = speechProviderSelect ? speechProviderSelect.value : 'whisper';
+        providerUI.setSpeechProvider(provider);
+        document.getElementById('cloudflareSpeechFields').hidden = provider !== 'cloudflare';
 
         // Show/hide provider-specific field groups instead of just disabling
         // them. This keeps the settings UI clean — only the relevant fields
@@ -168,7 +179,7 @@ document.addEventListener('DOMContentLoaded', () => {
             azureGroup.style.display = provider === 'azure' ? '' : 'none';
         }
         if (whisperGroup) {
-            whisperGroup.style.display = provider === 'whisper' ? '' : 'none';
+            whisperGroup.style.display = ['whisper', 'cloudflare'].includes(provider) ? '' : 'none';
         }
         if (azureNote) {
             azureNote.style.display = provider === 'azure' ? '' : 'none';
@@ -178,12 +189,15 @@ document.addEventListener('DOMContentLoaded', () => {
         [azureKeyInput, azureRegionInput].forEach(input => {
             if (input) input.disabled = provider !== 'azure';
         });
-        [whisperCommandInput, whisperModelInput, whisperLanguageInput, whisperDeviceSelect,
-            whisperCaptureModeSelect, whisperResponseTargetSelect, whisperSegmentMsInput].forEach(input => {
-            if (input) input.disabled = provider !== 'whisper';
+        [whisperCommandInput, whisperModelInput, whisperDeviceSelect].forEach(input => {
+            if (input) { input.disabled = provider !== 'whisper'; input.closest('.settings-item').hidden = provider !== 'whisper'; }
+        });
+        [whisperLanguageInput, whisperCaptureModeSelect, whisperResponseTargetSelect, whisperSegmentMsInput].forEach(input => {
+            if (input) input.disabled = !['whisper', 'cloudflare'].includes(provider);
         });
     };
 
+    providerUI.onChange = saveSettings;
     // Add event listeners for all inputs
     const inputs = [
         azureKeyInput,
@@ -195,8 +209,7 @@ document.addEventListener('DOMContentLoaded', () => {
         whisperCaptureModeSelect,
         whisperResponseTargetSelect,
         whisperSegmentMsInput,
-        geminiKeyInput,
-        windowGapInput
+        windowGapInput, cloudflareWhisperInput, systemAudioDeviceInput
     ];
 
     inputs.forEach(input => {

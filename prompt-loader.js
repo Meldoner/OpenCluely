@@ -1,13 +1,13 @@
 const fs = require('fs');
 const path = require('path');
+const skills = require('./src/core/skills');
 
 class PromptLoader {
   constructor() {
     this.prompts = new Map();
     this.promptsLoaded = false;
     this.skillPromptSent = new Set();
-    // Focus only on DSA
-    this.skillsRequiringProgrammingLanguage = ['dsa'];
+    this.skillsRequiringProgrammingLanguage = skills.filter(skill => skill.coding).map(skill => skill.id);
   }
 
   /**
@@ -28,7 +28,7 @@ class PromptLoader {
       for (const file of files) {
         if (file.endsWith('.md')) {
           const skillName = path.basename(file, '.md');
-          if (skillName !== 'dsa') continue; // only keep DSA
+          if (!skills.some(skill => skill.id === skillName)) continue;
           const filePath = path.join(promptsDir, file);
           const promptContent = fs.readFileSync(filePath, 'utf8');
           
@@ -78,8 +78,8 @@ class PromptLoader {
    * @returns {string} Modified prompt with programming language context
    */
   injectProgrammingLanguage(promptContent, programmingLanguage, skillName) {
-    const languageMap = { cpp: 'C++', c: 'C', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript' };
-    const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
+    const languageMap = { cpp: 'C++', c: 'C', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript', go: 'Go', golang: 'Go' };
+    const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript', go: 'go', golang: 'go' };
     const norm = (programmingLanguage || '').toLowerCase();
     const languageTitle = languageMap[norm] || (programmingLanguage.charAt(0).toUpperCase() + programmingLanguage.slice(1));
     const fenceTag = fenceTagMap[norm] || norm || 'text';
@@ -99,7 +99,7 @@ STRICT REQUIREMENTS:
 - Avoid unnecessary verbosity; focus on correctness, clarity, and efficiency.`;
         break;
       default:
-        languageInjection = `\n\n## PROGRAMMING LANGUAGE: ${languageUpper}\nAll code and examples must be in ${languageTitle}. Use code fences with tag: \`\`\`${fenceTag}\`\`\`.`;
+        languageInjection = `\n\n## PROGRAMMING LANGUAGE: ${languageUpper}\nUse ${languageTitle} for application code (fence tag: ${fenceTag}). Keep SQL, shell, YAML, HCL and other task-specific formats in their own language with correct fence tags.`;
     }
 
     return promptContent + languageInjection;
@@ -324,6 +324,14 @@ STRICT REQUIREMENTS:
     
     // Map common variations to standard names
     const skillMap = {
+      'backend dev': 'backend',
+      'backend-dev': 'backend',
+      'backend developer': 'backend',
+      'ml engineer': 'ml-engineer',
+      'ai engineer': 'ai-engineer',
+      'analyst': 'analyst',
+      'product analyst': 'analyst',
+      'аналитик': 'analyst',
       'dsa': 'dsa',
       'data-structures': 'dsa',
       'algorithms': 'dsa',
@@ -368,7 +376,7 @@ STRICT REQUIREMENTS:
     if (!this.promptsLoaded) {
       this.loadPrompts();
     }
-    return ['dsa'];
+    return skills.filter(skill => this.prompts.has(skill.id)).map(skill => skill.id);
   }
 
   /**
