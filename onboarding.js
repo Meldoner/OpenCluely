@@ -136,6 +136,10 @@
         // A key already in .env is enough — don't force a re-entry.
         return providerUI.isConfigured();
       case 'speech':
+        if (['gemini-live', 'gemini-live-audio'].includes(state.speechProvider)) {
+          return (state.speechProvider !== 'gemini-live-audio' || providerUI.provider.value === 'gemini-live') &&
+            !!$('#geminiLiveSpeechKey').value.trim() && !/^your[_-]|^placeholder/i.test($('#geminiLiveSpeechKey').value.trim());
+        }
         if (state.speechProvider === 'cloudflare') return /^[a-f0-9]{32}$/i.test($('#cloudflareSpeechAccountId').value.trim()) && !!$('#cloudflareSpeechToken').value.trim();
         if (state.speechProvider === 'azure') {
           return !!state.azureKey.trim() && !!state.azureRegion.trim();
@@ -155,6 +159,7 @@
 
   // ── Wire up: API key ──────────────────────────────────────────────
   const providerUI = new ProviderSettings($('#onboardingProviderSettings'));
+  const transcribeLanguages = new GeminiTranscribeSettings($('#geminiTranscribeOnboardingLanguages'));
   const keyStatus = $('#keyStatus');
   function setKeyStatus(status, text) {
     keyStatus.className = 'status-pill ' + status;
@@ -171,8 +176,11 @@
       const azurePanel = $('#azurePanel');
       azurePanel.style.display = value === 'azure' ? 'block' : 'none';
       $('#cloudflareSpeechPanel').style.display = value === 'cloudflare' ? 'block' : 'none';
+      $('#geminiLiveSpeechPanel').style.display = ['gemini-live', 'gemini-live-audio'].includes(value) ? 'block' : 'none';
+      $('#geminiTranscribeOnboardingLanguages').style.display = value === 'gemini-live-audio' ? 'none' : '';
       providerUI.setSpeechProvider(value);
       const cloudflare = providerUI.values();
+      $('#geminiLiveSpeechKey').value = cloudflare.geminiKey;
       $('#cloudflareSpeechAccountId').value = cloudflare.cloudflareAccountId;
       $('#cloudflareSpeechToken').value = cloudflare.cloudflareToken;
       if (value !== 'azure') {
@@ -432,6 +440,8 @@
         value: state.whisperDetected ? `Whisper (${state.whisperCmd || 'cli'})` : 'Whisper (not installed)',
         cls: state.whisperDetected ? 'ok' : 'skip',
       });
+    } else if (['gemini-live', 'gemini-live-audio'].includes(state.speechProvider)) {
+      rows.push({ label: 'Speech', value: state.speechProvider === 'gemini-live-audio' ? 'Gemini-3.8-Live / audio + answers' : 'Gemini-3.5-Transcribe Live / system audio', cls: 'ok' });
     } else if (state.speechProvider === 'cloudflare') {
       rows.push({ label: 'Speech', value: 'Cloudflare Whisper / system audio', cls: 'ok' });
     } else if (state.speechProvider === 'azure') {
@@ -506,6 +516,11 @@
           speechProvider:
             state.speechProvider === 'skip' ? 'disabled' : state.speechProvider,
         };
+        if (['gemini-live', 'gemini-live-audio'].includes(state.speechProvider)) {
+          payload.geminiKey = $('#geminiLiveSpeechKey').value.trim();
+          if (state.speechProvider === 'gemini-live') payload.geminiTranscribeLanguages = transcribeLanguages.values();
+          providerUI.inputs.get('geminiKey').value = payload.geminiKey;
+        }
         if (state.speechProvider === 'cloudflare') {
           payload.cloudflareAccountId = $('#cloudflareSpeechAccountId').value.trim();
           payload.cloudflareToken = $('#cloudflareSpeechToken').value.trim();
@@ -598,6 +613,12 @@
   // Hook into showScreen to keep skip visibility in sync
   const _origShowScreen = showScreen;
   showScreen = function (name) {
+    if (name === 'speech') {
+      const nativeCard = $('#speechChoices [data-value="gemini-live-audio"]');
+      nativeCard.hidden = providerUI.provider.value !== 'gemini-live';
+      nativeCard.style.display = nativeCard.hidden ? 'none' : '';
+      if (nativeCard.hidden && state.speechProvider === 'gemini-live-audio') $('#speechChoices [data-value="gemini-live"]').click();
+    }
     _origShowScreen(name);
     refreshSkipVisibility();
     refreshStepper();
@@ -637,6 +658,9 @@
   showScreen('welcome');
 
   if (window.electronAPI) {
-    window.electronAPI.getSettings().then(settings => providerUI.load(settings)).catch(() => {});
+    window.electronAPI.getSettings().then(settings => {
+      providerUI.load(settings);
+      transcribeLanguages.load(settings.geminiTranscribeLanguages || []);
+    }).catch(() => {});
   }
 })();

@@ -7,6 +7,8 @@ const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const FirstRunManager = require('../src/core/first-run');
 const config = require('../src/core/config');
+const { DEFAULTS } = require('../src/core/ai-settings');
+const { parse: parseTranscribeLanguages } = require('../src/core/gemini-transcribe-languages');
 const { validateEndpoint } = require('../src/services/ai-http');
 const { configureNetworkSession } = require('../src/core/network-session');
 const catalogue = require('../src/core/skills');
@@ -63,12 +65,12 @@ function mainController(env = {}) {
   const start = source.indexOf('class ApplicationController {');
   const end = source.indexOf('\n}\n', start) + 2;
   const broadcasts = [];
-  const speechService = { isRecording: false, isProcessingAudio: false, initializeClient() { this.initializations = (this.initializations || 0) + 1; }, isAvailable: () => true };
+  const speechService = Object.assign(new EventEmitter(), { isRecording: false, isProcessingAudio: false, initializeClient() { this.initializations = (this.initializations || 0) + 1; }, isAvailable: () => true });
   const llmService = { initializeClient() { this.initializations = (this.initializations || 0) + 1; } };
-  const context = { process: { env }, skills: catalogue, config, validateEndpoint, configureNetworkSession, logger: silentLogger,
+  const context = { process: { env }, skills: catalogue, config, DEFAULTS, parseTranscribeLanguages, validateEndpoint, configureNetworkSession, logger: silentLogger,
     speechService, llmService, sessionManager: { setActiveSkill(skill) { this.skill = skill; } },
     windowManager: { broadcastToAllWindows: (channel, data) => broadcasts.push({ channel, data }) },
-    require, Buffer, path, fs, formatEnvValue: value => String(value), ENV_PATH: 'unused' };
+    require, Buffer, path, fs, BrowserWindow: { getAllWindows: () => [] }, formatEnvValue: value => String(value), ENV_PATH: 'unused' };
   vm.runInNewContext(source.slice(start, end) + '\nthis.Controller = ApplicationController;', context);
   const controller = Object.create(context.Controller.prototype);
   controller.activeSkill = 'dsa'; controller.codingLanguage = 'cpp';
@@ -157,6 +159,134 @@ test('invalid settings and speech changes during capture leave current configura
   assert.equal(controller.saveSettings({ codingLanguage: 'go' }).success, true);
 });
 
+test('Live selections persist and a shared Gemini key cannot change during Live capture', () => {
+  const { controller, context } = mainController();
+  const result = controller.saveSettings({ llmProvider: 'gemini-live', speechProvider: 'gemini-live', geminiKey: 'test-key' });
+  assert.equal(result.success, true);
+  assert.equal(context.process.env.LLM_PROVIDER, 'gemini-live');
+  assert.equal(context.process.env.SPEECH_PROVIDER, 'gemini-live');
+  assert.equal(context.process.env.GEMINI_API_KEY, 'test-key');
+  context.speechService.provider = 'gemini-live';
+  assert.equal(controller.getSettings().llmProvider, 'gemini-live');
+  assert.equal(controller.getSettings().speechProvider, 'gemini-live');
+  context.speechService.isRecording = true;
+  assert.equal(controller.saveSettings({ geminiKey: 'replacement' }).success, false);
+  assert.equal(context.process.env.GEMINI_API_KEY, 'test-key');
+  context.speechService.isRecording = false;
+  assert.equal(controller.saveSettings({ geminiKey: 'replacement' }).success, true);
+  assert.equal(context.speechService.initializations, 2);
+});
+
+test('native Gemini audio requires matching answers and external transcribers stay independently selectable', () => {
+  const { controller, context } = mainController({ LLM_PROVIDER: 'openai', SPEECH_PROVIDER: 'disabled' });
+  assert.equal(controller.saveSettings({ speechProvider: 'gemini-live-audio' }).success, false);
+  assert.equal(context.process.env.SPEECH_PROVIDER, 'disabled');
+  assert.equal(controller.saveSettings({ llmProvider: 'gemini-live', speechProvider: 'gemini-live-audio' }).success, true);
+  assert.equal(controller.getSettings().speechProvider, 'gemini-live-audio');
+  assert.equal(controller.saveSettings({ llmProvider: 'openai' }).success, false);
+  assert.equal(context.process.env.LLM_PROVIDER, 'gemini-live');
+  for (const provider of ['gemini-live', 'whisper', 'azure', 'cloudflare', 'disabled']) {
+    assert.equal(controller.saveSettings({ speechProvider: provider }).success, true);
+    assert.equal(controller.getSettings().speechProvider, provider);
+    assert.equal(controller.getSettings().llmProvider, 'gemini-live');
+  }
+});
+
+test('a Cloudflare transcript is sent as text to Gemini 3.8 answers through the regular voice path', async () => {
+  const { controller, context } = mainController({ LLM_PROVIDER: 'gemini-live', SPEECH_PROVIDER: 'cloudflare' });
+  const { service } = speechService(async () => 'Explain indexes');
+  const requests = []; const events = [];
+  context.speechService = service;
+  context.llmService.buildLiveAudioRequest = () => assert.fail('An external transcriber must not request native audio');
+  context.llmService.processTranscriptionWithIntelligentResponseStream = async (text, skill, history, language, onDelta) => {
+    requests.push({ text, skill }); onDelta('Answer');
+    return { response: 'Answer', metadata: {} };
+  };
+  context.sessionManager.addUserInput = () => {};
+  context.sessionManager.addModelResponse = () => {};
+  context.sessionManager.getOptimizedHistory = () => ({ recent: [] });
+  context.windowManager.handleRecordingStarted = () => {};
+  context.windowManager.handleRecordingStopped = () => {};
+  controller.sendToVoiceResponseWindows = (channel, data) => events.push({ channel, data });
+  controller.shouldShowVoiceOverlay = () => false;
+  controller._utteranceBuffer = '';
+  controller.setupServiceEventHandlers();
+  const done = new Promise(resolve => controller.sendTranscriptionLLMResponseToVoiceTargets = result => { events.push({ channel: 'final', data: result }); resolve(); });
+  service.startRecording();
+  service.handleAudioChunkFromRenderer(Buffer.alloc(3200, 1));
+  service.stopRecording();
+  await done;
+  assert.deepEqual(requests, [{ text: 'Explain indexes', skill: 'dsa' }]);
+  assert.equal(events.find(event => event.channel === 'final').data.response, 'Answer');
+  service.shutdown();
+});
+
+test('Live voice events display one response without requesting a second answer, and clearing rejects late events', () => {
+  const { controller, context } = mainController({ LLM_PROVIDER: 'gemini-live', SPEECH_PROVIDER: 'disabled' });
+  const events = []; const history = [];
+  context.sessionManager.addUserInput = text => history.push(['user', text]);
+  context.sessionManager.addModelResponse = text => history.push(['model', text]);
+  context.sessionManager.clear = () => { history.length = 0; };
+  controller.sendToVoiceResponseWindows = (channel, data) => events.push({ channel, data });
+  controller.shouldShowVoiceOverlay = () => false;
+  context.llmService.buildLiveAudioRequest = () => ({ contents: [], metadata: { skill: 'dsa' } });
+  context.llmService.processTranscriptionWithIntelligentResponseStream = () => assert.fail('Audio answers must not resubmit transcripts');
+  controller.setupServiceEventHandlers();
+  context.speechService.emit('live-transcription', 'Question');
+  const data = { messageId: 'live-1', metadata: { skill: 'dsa' }, startedAt: Date.now() };
+  context.speechService.emit('live-response-start', data);
+  context.speechService.emit('live-response-chunk', { messageId: data.messageId, delta: 'Answer' });
+  context.speechService.emit('live-response-complete', { ...data, response: 'Answer' });
+  assert.deepEqual(history, [['user', 'Question'], ['model', 'Answer']]);
+  assert.deepEqual(events.map(event => event.channel), ['transcription-received', 'transcription-llm-response-start', 'transcription-llm-response-chunk', 'transcription-llm-response']);
+  assert.equal(new Set(events.slice(1).map(event => event.data.messageId)).size, 1);
+  context.speechService.emit('live-response-start', { ...data, messageId: 'old' });
+  let cancelled = false;
+  context.speechService.cancelLiveRecording = () => { cancelled = true; };
+  controller.clearSessionMemory();
+  const before = events.length;
+  context.speechService.emit('live-response-complete', { ...data, messageId: 'old', response: 'Stale' });
+  assert.equal(cancelled, true);
+  assert.equal(events.length, before);
+  assert.deepEqual(history, []);
+});
+
+test('switching to or from Live answers reinitializes audio and requires active capture to stop first', () => {
+  const { controller, context } = mainController({ LLM_PROVIDER: 'openai', SPEECH_PROVIDER: 'disabled' });
+  assert.equal(controller.saveSettings({ llmProvider: 'gemini-live' }).success, true);
+  assert.equal(context.speechService.initializations, 1);
+  assert.equal(context.process.env.SPEECH_PROVIDER, 'disabled');
+  context.speechService.isRecording = true;
+  assert.equal(controller.saveSettings({ llmProvider: 'openai' }).success, false);
+  assert.equal(context.process.env.LLM_PROVIDER, 'gemini-live');
+  context.speechService.isRecording = false;
+  assert.equal(controller.saveSettings({ llmProvider: 'openai' }).success, true);
+  assert.equal(context.speechService.initializations, 2);
+});
+
+test('Transcribe Live language lists persist, normalize, reset to auto and reject changes during capture', () => {
+  const { controller, context } = mainController({ SPEECH_PROVIDER: 'gemini-live' });
+  assert.deepEqual(Array.from(controller.getSettings().geminiTranscribeLanguages), []);
+  assert.equal(controller.saveSettings({ geminiTranscribeLanguages: ['ru-ru', 'en-US', 'ru-RU'] }).success, true);
+  assert.equal(context.process.env.GEMINI_TRANSCRIBE_LANGUAGES, 'ru-RU,en-US');
+  assert.deepEqual(Array.from(controller.getSettings().geminiTranscribeLanguages), ['ru-RU', 'en-US']);
+  assert.equal(context.speechService.initializations, 1);
+  assert.equal(context.llmService.initializations, undefined);
+  for (const value of [['ru-RU', 'unsupported'], { language: 'ru-RU' }, ['en-US', 1], 'ru-RU\nLLM_PROVIDER=openai']) {
+    assert.equal(controller.saveSettings({ geminiTranscribeLanguages: value }).success, false);
+    assert.equal(context.process.env.GEMINI_TRANSCRIBE_LANGUAGES, 'ru-RU,en-US');
+  }
+  context.speechService.isRecording = true;
+  assert.equal(controller.saveSettings({ geminiTranscribeLanguages: [] }).success, false);
+  context.speechService.isRecording = false;
+  context.speechService.isProcessingAudio = true;
+  assert.equal(controller.saveSettings({ geminiTranscribeLanguages: [] }).success, false);
+  context.speechService.isProcessingAudio = false;
+  assert.equal(controller.saveSettings({ geminiTranscribeLanguages: [] }).success, true);
+  assert.equal(context.process.env.GEMINI_TRANSCRIBE_LANGUAGES, '');
+  assert.deepEqual(Array.from(controller.getSettings().geminiTranscribeLanguages), []);
+});
+
 test('a failed config write does not update runtime credentials', () => {
   const { controller, context } = mainController({ OPENAI_API_KEY: 'old-test-key' });
   delete controller.persistEnvUpdates;
@@ -178,6 +308,8 @@ test('first-run accepts the selected OpenAI provider without a Gemini key', t =>
   const manager = new FirstRunManager({ envPath, sentinelPath });
   assert.equal(manager.needsOnboarding(), false);
   assert.equal(manager.getStatus().llmConfigured, true);
+  fs.writeFileSync(envPath, 'LLM_PROVIDER=gemini-live\nGEMINI_API_KEY=test-key\n');
+  assert.equal(manager.needsOnboarding(), false);
   fs.writeFileSync(envPath, 'LLM_PROVIDER=cloudflare\nCLOUDFLARE_API_TOKEN=test-token\n');
   assert.equal(manager.needsOnboarding(), true);
 });

@@ -361,17 +361,21 @@
                     <div class="settings-item">
                         <div>
                             <div class="settings-item-label">Speech Provider</div>
-                            <div class="settings-item-description">Choose Azure Speech, local Whisper or Cloudflare Whisper</div>
+                            <div class="settings-item-description">Choose Azure, Whisper or Gemini Live transcription</div>
                         </div>
                         <select class="input-field" id="speechProvider">
                             <option value="azure">Azure Speech</option>
                             <option value="whisper">Local Whisper</option>
                             <option value="cloudflare">Cloudflare Whisper</option>
+                            <option value="gemini-live">Gemini-3.5-Transcribe Live</option>
+                            <option value="gemini-live-audio">Gemini-3.8-Live (audio + answers)</option>
                             <option value="disabled">Disabled</option>
                         </select>
                     </div>
 
                     <div class="settings-note">Audio source: computer output. Windows uses system loopback; Linux uses the default output monitor. macOS requires a routed virtual loopback device.</div>
+                    <div id="geminiLiveSpeechFields" class="settings-note" hidden>Gemini-3.5-Transcribe Live streams computer audio to Google. Uses the Gemini API key in AI Providers below and detects the language automatically. Sessions last up to 10 minutes; restart recording when the limit is reached.</div>
+                    <div id="geminiTranscribeLanguageFields" class="settings-group" hidden></div>
                     <div class="settings-item">
                         <div><div class="settings-item-label">macOS loopback device name</div><div class="settings-item-description">Exact input label, e.g. BlackHole 2ch. Route computer output to this virtual device.</div></div>
                         <input class="input-field" id="systemAudioDevice" placeholder="BlackHole 2ch">
@@ -497,6 +501,8 @@
     </div>
 
     <script src="./src/ui/provider-settings.js"></script>
+    <script src="./src/core/gemini-transcribe-languages.js"></script>
+    <script src="./src/ui/gemini-transcribe-settings.js"></script>
     <script src="./src/ui/settings-window.js"></script>
 </body>
 </html>

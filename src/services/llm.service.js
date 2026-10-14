@@ -301,6 +301,7 @@ class LLMService {
         }
       };
     } catch (error) {
+      if (this.provider === 'gemini-live') throw error;
       logger.warn('Streaming image analysis failed, falling back to non-streaming', {
         error: error.message,
         requestId: this.requestCount
@@ -442,6 +443,7 @@ class LLMService {
         }
       };
     } catch (error) {
+      if (this.provider === 'gemini-live') throw error;
       logger.warn('Streaming text failed, falling back to non-streaming', {
         error: error.message,
         requestId: this.requestCount
@@ -547,6 +549,18 @@ class LLMService {
     // The prompt controls language. Relabeling fences corrupts SQL, shell and
     // infrastructure examples and cannot translate code into another language.
     return text;
+  }
+
+  buildLiveAudioRequest(activeSkill, programmingLanguage) {
+    const sessionManager = require('../managers/session.manager');
+    const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
+    return {
+      systemInstruction: { parts: [{ text: `${skillPrompt}\n\n# Live audio input\nListen directly to the incoming audio and answer the interviewer using the same concise interview style. Use the conversation for follow-ups. If an essential detail is unclear, ask one short clarification. Do not answer silence, filler or recording status messages.` }] },
+      contents: sessionManager.getConversationHistory(15)
+        .filter(event => ['user', 'model'].includes(event.role) && typeof event.content === 'string' && event.content.trim())
+        .map(event => ({ role: event.role, parts: [{ text: event.content.trim() }] })),
+      metadata: { skill: activeSkill, programmingLanguage, isTranscriptionResponse: true }
+    };
   }
 
   buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage) {
@@ -792,6 +806,7 @@ Do not respond to recording status messages or filler with a technical lecture.`
   }
 
   async executeRequest(geminiRequest) {
+    if (this.provider === 'gemini-live') return require('./gemini-live.service').complete(geminiRequest);
     if (this.provider !== 'gemini') return compatible.complete(geminiRequest);
     const maxRetries = config.get('llm.gemini.maxRetries');
     const timeout = config.get('llm.gemini.timeout');
@@ -973,6 +988,7 @@ Do not respond to recording status messages or filler with a technical lecture.`
         }
       };
     } catch (error) {
+      if (this.provider === 'gemini-live') throw error;
       logger.warn('Streaming transcription failed, falling back to non-streaming', {
         error: error.message,
         requestId: this.requestCount
@@ -1008,6 +1024,7 @@ Do not respond to recording status messages or filler with a technical lecture.`
    * for each chunk.
    */
   async executeStreamingRequest(geminiRequest, onDelta) {
+    if (this.provider === 'gemini-live') return require('./gemini-live.service').complete(geminiRequest, onDelta);
     if (this.provider !== 'gemini') return compatible.complete(geminiRequest, onDelta);
     const maxRetries = config.get('llm.gemini.maxRetries');
     const apiKey = config.getApiKey('GEMINI');
@@ -1352,7 +1369,7 @@ Do not respond to recording status messages or filler with a technical lecture.`
     if (this.provider !== 'gemini') {
       try {
         const start = Date.now();
-        const response = await compatible.complete({ contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }], generationConfig: { maxOutputTokens: 1024 } });
+        const response = await this.executeRequest({ contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }], generationConfig: { maxOutputTokens: 1024 } });
         return { success: true, response, model: this.model, provider: this.provider, latency: Date.now() - start };
       } catch (error) { return { success: false, error: error.message }; }
     }
@@ -1497,6 +1514,7 @@ Do not respond to recording status messages or filler with a technical lecture.`
   }
 
   async executeAlternativeRequest(geminiRequest) {
+    if (this.provider === 'gemini-live') return require('./gemini-live.service').complete(geminiRequest);
     if (this.provider !== 'gemini') return compatible.complete(geminiRequest);
     const https = require('https');
     const apiKey = config.getApiKey('GEMINI');

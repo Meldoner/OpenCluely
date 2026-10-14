@@ -767,6 +767,8 @@
                         <div class="choice-radio"></div>
                     </div>
                     <div class="choice-card" data-value="cloudflare"><div class="choice-icon"><i class="fas fa-cloud"></i></div><div class="choice-title">Cloudflare Whisper</div><div class="choice-desc">Cloud transcription. No local Python or model installation.</div></div>
+                    <div class="choice-card" data-value="gemini-live"><div class="choice-icon"><i class="fas fa-wave-square"></i></div><div class="choice-text"><div class="choice-title">Gemini-3.5-Transcribe Live</div><div class="choice-desc">Live cloud transcription of computer audio using your AI Studio key.</div></div><div class="choice-radio"></div></div>
+                    <div class="choice-card" data-value="gemini-live-audio"><div class="choice-icon"><i class="fas fa-wave-square"></i></div><div class="choice-text"><div class="choice-title">Gemini-3.8-Live (audio + answers)</div><div class="choice-desc">Send computer audio directly to the selected Gemini-3.8-Live answer model.</div></div><div class="choice-radio"></div></div>
                     <div class="choice-card" data-value="azure">
                         <div class="choice-icon"><i class="fas fa-cloud"></i></div>
                         <div class="choice-text">
@@ -791,6 +793,11 @@
                 </div>
 
                 <!-- Inline Azure key entry (revealed only if Azure selected) -->
+                <div id="geminiLiveSpeechPanel" style="display:none;">
+                    <div class="field"><label for="geminiLiveSpeechKey">Gemini API Key (AI Studio)</label><input class="input" type="password" id="geminiLiveSpeechKey" autocomplete="off"></div>
+                    <div id="geminiTranscribeOnboardingLanguages"></div>
+                    <p class="hint">Computer audio is streamed to Google. The same key can be used for Gemini-3.8-Live answers.</p>
+                </div>
                 <div id="cloudflareSpeechPanel" style="display:none;">
                     <div class="field"><label for="cloudflareSpeechAccountId">Cloudflare Account ID</label><input class="input" id="cloudflareSpeechAccountId" autocomplete="off"></div>
                     <div class="field"><label for="cloudflareSpeechToken">Cloudflare API Token</label><input class="input" type="password" id="cloudflareSpeechToken" autocomplete="off"></div>
@@ -944,6 +951,8 @@
     </div>
 
     <script src="./src/ui/provider-settings.js"></script>
+    <script src="./src/core/gemini-transcribe-languages.js"></script>
+    <script src="./src/ui/gemini-transcribe-settings.js"></script>
     <script src="./onboarding.js"></script>
 </body>
 </html>

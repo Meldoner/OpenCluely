@@ -103,6 +103,7 @@
         padding: 20px;
         overflow-y: auto;
         overflow-x: hidden;
+        overflow-anchor: none;
         -webkit-app-region: no-drag;
         box-sizing: border-box;
         /* Removed max-height restriction */
@@ -750,6 +751,13 @@
       const finishedResponseIds = new Set();
       const responseSubscriptions = [];
 
+      function updateChatMessages(update) {
+        // Read the position immediately before rendering, including delayed chunks.
+        const atBottom = chatMessages.scrollHeight - chatMessages.clientHeight - chatMessages.scrollTop <= 1;
+        update();
+        if (atBottom) chatMessages.scrollTop = chatMessages.scrollHeight;
+      }
+
       function rememberFinishedResponse(messageId) {
         finishedResponseIds.add(messageId);
         if (finishedResponseIds.size > 500) finishedResponseIds.delete(finishedResponseIds.values().next().value);
@@ -897,8 +905,7 @@
         messageDiv.appendChild(timeDiv);
         messageDiv.appendChild(textDiv);
 
-        chatMessages.appendChild(messageDiv);
-        chatMessages.scrollTop = chatMessages.scrollHeight;
+        updateChatMessages(() => chatMessages.appendChild(messageDiv));
 
         if (!skipPersist) {
           chatHistory.push({ kind: 'message', type, text });
@@ -946,13 +953,14 @@
         thinkingDiv.appendChild(timeDiv);
         thinkingDiv.appendChild(textDiv);
 
-        chatMessages.appendChild(thinkingDiv);
-        chatMessages.scrollTop = chatMessages.scrollHeight;
+        updateChatMessages(() => chatMessages.appendChild(thinkingDiv));
       }
 
       // Hide thinking indicator
       function hideThinkingIndicator() {
-        document.querySelectorAll('#thinking-indicator').forEach(indicator => indicator.remove());
+        updateChatMessages(() => {
+          document.querySelectorAll('#thinking-indicator').forEach(indicator => indicator.remove());
+        });
       }
 
       if (whysperAPI) {
@@ -964,7 +972,7 @@
           if (state) {
             clearTimeout(state.timer);
             if (state.element && state.text) {
-              renderResponseContent(state.element.querySelector('.message-text'), state.text);
+              updateChatMessages(() => renderResponseContent(state.element.querySelector('.message-text'), state.text));
               chatHistory.push({ kind: 'message', type: 'assistant', text: state.text });
               saveHistory();
             } else state.element?.remove();
@@ -1155,8 +1163,7 @@
 
         messageDiv.appendChild(timeDiv);
         messageDiv.appendChild(textDiv);
-        chatMessages.appendChild(messageDiv);
-        chatMessages.scrollTop = chatMessages.scrollHeight;
+        updateChatMessages(() => chatMessages.appendChild(messageDiv));
 
         try { if (window.Prism && Prism.highlightElement) { Prism.highlightElement(codeEl); } } catch (_) {}
 
@@ -1205,9 +1212,10 @@
           if (!state.timer) state.timer = setTimeout(() => {
             state.timer = 0;
             const content = state.element.querySelector('.message-text');
-            content.style.whiteSpace = 'pre-wrap';
-            content.textContent = state.text;
-            chatMessages.scrollTop = chatMessages.scrollHeight;
+            updateChatMessages(() => {
+              content.style.whiteSpace = 'pre-wrap';
+              content.textContent = state.text;
+            });
           }, 30);
         }));
       }
@@ -1220,12 +1228,11 @@
           if (state) clearTimeout(state.timer);
           const element = state?.element || addMessage('', 'assistant', true);
           element.dataset.messageId = messageId;
-          renderResponseContent(element.querySelector('.message-text'), response);
+          updateChatMessages(() => renderResponseContent(element.querySelector('.message-text'), response));
           activeResponses.delete(messageId);
           rememberFinishedResponse(messageId);
           chatHistory.push({ kind: 'message', type: 'assistant', text: response });
           saveHistory();
-          chatMessages.scrollTop = chatMessages.scrollHeight;
           return;
         }
         // Deduplication: avoid processing the same response twice

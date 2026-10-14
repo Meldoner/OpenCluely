@@ -454,6 +454,15 @@ class SpeechService extends EventEmitter {
       return;
     }
 
+    if (this._isGeminiLiveProvider()) {
+      const nativeMismatch = provider === 'gemini-live-audio' && process.env.LLM_PROVIDER !== 'gemini-live';
+      this.available = require('../core/ai-settings').isConfiguredKey(process.env.GEMINI_API_KEY) &&
+        !nativeMismatch;
+      this.emit('status', nativeMismatch ? 'Select Gemini-3.8-Live in AI Providers to use its audio input' :
+        this.available ? `${this.usesLiveAudioAnswers() ? 'Gemini-3.8-Live audio' : 'Gemini-3.5-Transcribe Live'} ready` : 'Configure the Gemini API key in AI Providers');
+      return;
+    }
+
     const reason = 'Speech recognition disabled. Configure local Whisper, Cloudflare Whisper or Azure.';
     logger.warn(reason);
     this.emit('status', reason);
@@ -560,6 +569,11 @@ class SpeechService extends EventEmitter {
 
       if (this.provider === 'azure') {
         this._startAzureRecording();
+        return;
+      }
+
+      if (this._isGeminiLiveProvider()) {
+        this._startGeminiLiveRecording();
         return;
       }
 
@@ -707,6 +721,99 @@ class SpeechService extends EventEmitter {
       this._startSegmentWatchdog();
     }
 
+  }
+
+  async _startGeminiLiveRecording() {
+    this._cleanup();
+    this.isRecording = true;
+    this.liveHadSpeech = false;
+    this.liveAudioBytes = 0;
+    this.liveFinalTranscripts = [];
+    const manual = this.isManualCaptureMode();
+    const audioAnswers = this.usesLiveAudioAnswers();
+    const liveAPI = require('./gemini-live.service');
+    let live;
+    try {
+      live = audioAnswers
+        ? liveAPI.createAudioConversation(this.getLiveAudioRequest(), { manual })
+        : liveAPI.createTranscription({ manual, languageCodes: this._getGeminiTranscribeLanguages() });
+    } catch (error) { this._abortGeminiLive(error); return; }
+    this.liveSession = live;
+    if (audioAnswers) {
+      live.on('transcription', text => {
+        if (this.liveSession !== live) return;
+        this.liveHadSpeech = false;
+        this.emit('live-transcription', text);
+        this.emit('interim-transcription', '');
+      });
+      live.on('interim-transcription', text => { if (this.liveSession === live) this.emit('interim-transcription', text); });
+      for (const event of ['response-start', 'response-chunk', 'response-complete', 'response-error']) {
+        live.on(event, data => { if (this.liveSession === live) this.emit(`live-${event}`, data); });
+      }
+    } else live.on('content', content => {
+      if (this.liveSession !== live) return;
+      if (content.interimInputTranscription?.text) this.emit('interim-transcription', content.interimInputTranscription.text);
+      if (content.inputTranscription?.text) {
+        const text = content.inputTranscription.text.trim();
+        this.liveHadSpeech = false;
+        if (text) {
+          if (manual) this.liveFinalTranscripts.push(text);
+          else this.emit('transcription', text);
+        }
+        this.emit('interim-transcription', '');
+      }
+    });
+    live.on('closed', error => {
+      if (this.liveSession === live) this._abortGeminiLive(error);
+    });
+    this.emit('status', 'Connecting to Gemini Live…');
+    try {
+      await live.connect();
+      if (this.liveSession !== live || !this.isRecording) return;
+      if (manual) live.send({ realtimeInput: { activityStart: {} } });
+      this._startSystemAudioCapture();
+      if (this.liveSession !== live || !this.isRecording) return;
+      this.emit('status', 'Gemini Live system audio recording started');
+      // Close before the documented ten-minute transcription session limit.
+      this.liveLimitTimer = setTimeout(() => this.stopRecording(), 590000);
+    } catch (error) {
+      if (this.liveSession === live) this._abortGeminiLive(error);
+    }
+  }
+
+  _abortGeminiLive(error) {
+    if (this.liveSession && !this.liveSession.closed) { this.liveSession.fail(error); return; }
+    this.isRecording = false;
+    this.isProcessingAudio = false;
+    this._cleanup();
+    this.emit('recording-stopped');
+    this.emit('error', error.message);
+    this.emit('status', 'Gemini Live recording stopped');
+  }
+
+  async _stopGeminiLiveRecording() {
+    const live = this.liveSession;
+    this.isProcessingAudio = true;
+    this.emit('recording-stopped');
+    this.useRendererCapture = false;
+    this.emit('status', 'Finishing Live transcription…');
+    try {
+      if (this.recording) { this.recording.stop(); this.recording = null; }
+      if (live?.ready) {
+        await live.finish({ hasSpeech: this.liveHadSpeech });
+        if (!this.usesLiveAudioAnswers() && this.liveSession === live && this.isManualCaptureMode() && this.liveFinalTranscripts.length) {
+          this.emit('transcription', this.liveFinalTranscripts.join(' '));
+        }
+      }
+    } catch (error) {
+      if (this.liveSession === live) live.fail(error);
+    } finally {
+      if (this.liveSession === live) {
+        this._cleanup();
+        this.isProcessingAudio = false;
+        this.emit('status', 'Recording stopped');
+      }
+    }
   }
 
   /**
@@ -973,6 +1080,11 @@ class SpeechService extends EventEmitter {
       return;
     }
 
+    if (this._isGeminiLiveProvider()) {
+      this._stopGeminiLiveRecording();
+      return;
+    }
+
     if (this._isWhisperProvider()) {
       this.isProcessingAudio = true;
       this.emit('recording-stopped');
@@ -1024,6 +1136,12 @@ class SpeechService extends EventEmitter {
   }
 
   _cleanup() {
+    if (this.liveLimitTimer) { clearTimeout(this.liveLimitTimer); this.liveLimitTimer = null; }
+    if (this.liveSession) {
+      const live = this.liveSession;
+      this.liveSession = null;
+      live.close();
+    }
     if (this.segmentTimer) {
       clearInterval(this.segmentTimer);
       this.segmentTimer = null;
@@ -1119,6 +1237,15 @@ class SpeechService extends EventEmitter {
   }
 
   async testConnection() {
+    if (this._isGeminiLiveProvider()) {
+      if (this.provider === 'gemini-live-audio' && !this.usesLiveAudioAnswers()) return { success: false, message: 'Select Gemini-3.8-Live in AI Providers to use its audio input' };
+      if (!process.versions?.electron) return { success: false, message: 'Live API requires Electron networking. Use scripts/run-electron.js scripts/aistudio-live.js --env <path> --text "Reply with OK."' };
+      const liveAPI = require('./gemini-live.service');
+      const live = this.usesLiveAudioAnswers() ? liveAPI.createAudioConversation({ contents: [] }) : liveAPI.createTranscription({ languageCodes: this._getGeminiTranscribeLanguages() });
+      try { await live.connect(); return { success: true, message: 'Gemini Live connected (no audio uploaded)' }; }
+      catch (error) { return { success: false, message: error.message }; }
+      finally { live.close(); }
+    }
     if (this.provider === 'cloudflare') {
       return { success: cloudflareSpeech.isConfigured(), message: 'Cloudflare configuration check (no audio uploaded)' };
     }
@@ -1207,6 +1334,7 @@ class SpeechService extends EventEmitter {
   }
 
   isAvailable() {
+    if (this._isGeminiLiveProvider()) return this.available && require('../core/ai-settings').isConfiguredKey(process.env.GEMINI_API_KEY);
     if (this.provider === 'cloudflare') return this.available && cloudflareSpeech.isConfigured();
     if (this.provider === 'azure') {
       return !!this.speechConfig && !!this.available;
@@ -1220,7 +1348,25 @@ class SpeechService extends EventEmitter {
   }
 
   isManualCaptureMode() {
-    return this._isWhisperProvider() && this._getWhisperCaptureMode() === 'manual';
+    return (this._isWhisperProvider() || this._isGeminiLiveProvider()) && this._getWhisperCaptureMode() === 'manual';
+  }
+
+  usesLiveAudioAnswers() {
+    return this.provider === 'gemini-live-audio' && process.env.LLM_PROVIDER === 'gemini-live';
+  }
+
+  _isGeminiLiveProvider() {
+    return ['gemini-live', 'gemini-live-audio'].includes(this.provider);
+  }
+
+  _getGeminiTranscribeLanguages() {
+    return require('../core/gemini-transcribe-languages').parse(this._getSetting('geminiTranscribeLanguages') ?? process.env.GEMINI_TRANSCRIBE_LANGUAGES ?? '');
+  }
+
+  cancelLiveRecording() {
+    if (!this.liveSession) return;
+    // Report cancellation while listeners still own the active response ID.
+    this.liveSession.close();
   }
 
   shutdown() {
@@ -1231,7 +1377,7 @@ class SpeechService extends EventEmitter {
   }
 
   updateSettings(settings = {}) {
-    const speechKeys = ['speechProvider', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs'];
+    const speechKeys = ['speechProvider', 'geminiTranscribeLanguages', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs'];
     let changed = false;
 
     for (const key of speechKeys) {
@@ -1251,7 +1397,7 @@ class SpeechService extends EventEmitter {
   _getConfiguredProvider() {
     const provider = String(this._getSetting('speechProvider') || process.env.SPEECH_PROVIDER || '').trim().toLowerCase();
 
-    if (['azure', 'whisper', 'cloudflare', 'disabled'].includes(provider)) {
+    if (['azure', 'whisper', 'cloudflare', 'gemini-live', 'gemini-live-audio', 'disabled'].includes(provider)) {
       return provider;
     }
 
@@ -1685,6 +1831,17 @@ class SpeechService extends EventEmitter {
 
   _handleAudioChunk(chunk) {
     if (!chunk || !chunk.length || !this.isRecording) {
+      return;
+    }
+
+    if (this._isGeminiLiveProvider()) {
+      try {
+        const buffer = Buffer.from(chunk);
+        if (this._chunkRmsEnergy(buffer) >= this._getVadEnergyFloor()) this.liveHadSpeech = true;
+        this.liveAudioBytes += buffer.length;
+        this.liveSession.sendAudio(buffer);
+        if (this.isManualCaptureMode() && this.liveAudioBytes / 32 >= this._getManualCaptureMaxMs()) this.stopRecording();
+      } catch (error) { this._abortGeminiLive(error); }
       return;
     }
 

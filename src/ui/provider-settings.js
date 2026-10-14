@@ -17,7 +17,7 @@
       label.textContent = 'AI provider';
       this.provider = document.createElement('select');
       this.provider.className = 'input-field input';
-      for (const [value, text] of [['gemini', 'Google Gemini'], ['openai', 'OpenAI / Compatible API'], ['cloudflare', 'Cloudflare Workers AI']]) {
+      for (const [value, text] of [['gemini', 'Google Gemini'], ['gemini-live', 'Gemini-3.8-Live (AI Studio)'], ['openai', 'OpenAI / Compatible API'], ['cloudflare', 'Cloudflare Workers AI']]) {
         const option = document.createElement('option'); option.value = value; option.textContent = text; this.provider.appendChild(option);
       }
       container.append(label, this.provider);
@@ -34,7 +34,7 @@
         input.addEventListener('change', () => this.onChange());
       }
       const note = document.createElement('p'); note.className = 'hint settings-note';
-      note.textContent = 'Cloudflare credentials are shared with Cloudflare Whisper. For screenshots choose a model that supports images. Keys are stored locally; requests go to the selected provider.';
+      note.textContent = 'Choose the speech provider independently of the answer model. With Gemini-3.8-Live, its own audio input is available alongside Whisper, Azure, Cloudflare and Transcribe Live. Live answers appear as text without audio playback. Keys are stored locally.';
       container.appendChild(note);
       const button = document.createElement('button'); button.type = 'button'; button.className = 'btn'; button.textContent = 'Test AI connection';
       this.status = document.createElement('p'); this.status.className = 'hint settings-note'; this.status.setAttribute('role', 'status');
@@ -62,11 +62,13 @@
     }
     setSpeechProvider(provider) { this.speechProvider = provider; this.updateVisibility(); }
     updateVisibility() {
-      for (const item of this.rows) item.row.hidden = item.provider !== this.provider.value && !(item.provider === 'cloudflare' && this.speechProvider === 'cloudflare');
+      for (const item of this.rows) item.row.hidden = item.provider !== this.provider.value &&
+        !(item.provider === 'gemini' && (this.provider.value === 'gemini-live' || this.speechProvider === 'gemini-live')) &&
+        !(item.provider === 'cloudflare' && this.speechProvider === 'cloudflare');
     }
     isConfigured() {
       const settings = this.values();
-      const key = settings.llmProvider === 'gemini' ? settings.geminiKey : settings.llmProvider === 'openai' ? settings.openaiKey : settings.cloudflareToken;
+      const key = ['gemini', 'gemini-live'].includes(settings.llmProvider) ? settings.geminiKey : settings.llmProvider === 'openai' ? settings.openaiKey : settings.cloudflareToken;
       return Boolean(key && !/^your[_-]|^placeholder/i.test(key) &&
         (settings.llmProvider !== 'cloudflare' || /^[a-f0-9]{32}$/i.test(settings.cloudflareAccountId)));
     }

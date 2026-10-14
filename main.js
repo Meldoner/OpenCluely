@@ -110,6 +110,7 @@ const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
 const skills = require('./src/core/skills');
 const { DEFAULTS } = require('./src/core/ai-settings');
+const { parse: parseTranscribeLanguages } = require('./src/core/gemini-transcribe-languages');
 const { validateEndpoint } = require('./src/services/ai-http');
 const { configureSystemAudioSession } = require('./src/core/system-audio-session');
 
@@ -402,6 +403,17 @@ class ApplicationController {
   }
 
   setupServiceEventHandlers() {
+    this._liveAudioResponses = new Map();
+    speechService.getLiveAudioRequest = () => llmService.buildLiveAudioRequest(
+      this.activeSkill, skills.find(skill => skill.id === this.activeSkill)?.coding ? this.codingLanguage : null
+    );
+    speechService.on('live-transcription', text => {
+      sessionManager.addUserInput(text, 'speech');
+      this.sendToVoiceResponseWindows('transcription-received', { text });
+    });
+    for (const event of ['response-start', 'response-chunk', 'response-complete', 'response-error']) {
+      speechService.on(`live-${event}`, data => this.handleLiveAudioResponse(event, data));
+    }
     speechService.on("recording-started", () => {
       windowManager.handleRecordingStarted();
     });
@@ -606,8 +618,7 @@ class ApplicationController {
     });
 
     ipcMain.handle("clear-session-memory", () => {
-      sessionManager.clear();
-      windowManager.broadcastToAllWindows("session-cleared");
+      this.clearSessionMemory();
       return { success: true };
     });
 
@@ -1226,6 +1237,42 @@ class ApplicationController {
     }
   }
 
+  clearSessionMemory() {
+    speechService.cancelLiveRecording?.();
+    this._liveAudioResponses?.clear();
+    sessionManager.clear();
+    windowManager.broadcastToAllWindows('session-cleared');
+  }
+
+  handleLiveAudioResponse(event, data) {
+    const { messageId } = data;
+    if (event === 'response-start') {
+      this._liveAudioResponses.set(messageId, data.metadata);
+      this.sendToVoiceResponseWindows('transcription-llm-response-start', { messageId, skill: data.metadata.skill });
+      if (this.shouldShowVoiceOverlay()) windowManager.showLLMLoading();
+      return;
+    }
+    if (!this._liveAudioResponses.has(messageId)) return;
+    if (event === 'response-chunk') {
+      this.sendToVoiceResponseWindows('transcription-llm-response-chunk', { messageId, delta: data.delta });
+      return;
+    }
+    const metadata = this._liveAudioResponses.get(messageId);
+    this._liveAudioResponses.delete(messageId);
+    if (event === 'response-error') {
+      this.sendToVoiceResponseWindows('llm-error', { messageId, error: data.error });
+      if (this.shouldShowVoiceOverlay()) windowManager.hideLLMResponse();
+      return;
+    }
+    const result = { response: data.response, metadata: {
+      ...metadata, messageId, processingTime: Date.now() - data.startedAt,
+      usedFallback: false, streamed: true, isTranscriptionResponse: true
+    } };
+    sessionManager.addModelResponse(result.response, result.metadata);
+    this.sendTranscriptionLLMResponseToVoiceTargets(result);
+    if (this.shouldShowVoiceOverlay()) windowManager.showLLMResponse(result.response, result.metadata);
+  }
+
   /**
    * Buffer a transcribed fragment and (re)arm the coalesce debounce. Fragments
    * are shown in the UI immediately so speech feels live, but the LLM is only
@@ -1577,6 +1624,7 @@ class ApplicationController {
   onWillQuit() {
     globalShortcut.unregisterAll();
     speechService.shutdown();
+    require('./src/services/gemini-live.service').shutdown();
     windowManager.destroyAllWindows();
 
     const sessionStats = sessionManager.getMemoryUsage();
@@ -1611,7 +1659,7 @@ class ApplicationController {
       selectedIcon: this.appIcon || "terminal",
       windowGap: windowManager.windowGap,
 
-      speechProvider: speechService.provider || "whisper",
+      speechProvider: process.env.SPEECH_PROVIDER || speechService.provider || "whisper",
       azureKey: process.env.AZURE_SPEECH_KEY || "",
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
       whisperCommand: process.env.WHISPER_COMMAND || "",
@@ -1623,6 +1671,7 @@ class ApplicationController {
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
       geminiKey: process.env.GEMINI_API_KEY || "",
+      geminiTranscribeLanguages: parseTranscribeLanguages(process.env.GEMINI_TRANSCRIBE_LANGUAGES ?? DEFAULTS.geminiTranscribeLanguages),
       llmProvider: process.env.LLM_PROVIDER || 'gemini',
       openaiKey: process.env.OPENAI_API_KEY || '',
       openaiModel: process.env.OPENAI_MODEL || DEFAULTS.openaiModel,
@@ -1643,6 +1692,7 @@ class ApplicationController {
       if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Invalid settings');
       const mapping = {
         llmProvider: 'LLM_PROVIDER', geminiKey: 'GEMINI_API_KEY',
+        geminiTranscribeLanguages: 'GEMINI_TRANSCRIBE_LANGUAGES',
         openaiKey: 'OPENAI_API_KEY', openaiModel: 'OPENAI_MODEL', openaiBaseUrl: 'OPENAI_BASE_URL',
         cloudflareAccountId: 'CLOUDFLARE_ACCOUNT_ID', cloudflareToken: 'CLOUDFLARE_API_TOKEN',
         cloudflareModel: 'CLOUDFLARE_MODEL', cloudflareWhisperModel: 'CLOUDFLARE_WHISPER_MODEL',
@@ -1654,7 +1704,7 @@ class ApplicationController {
         codingLanguage: 'CODING_LANGUAGE', activeSkill: 'ACTIVE_SKILL'
       };
       const enums = {
-        llmProvider: ['gemini', 'openai', 'cloudflare'], speechProvider: ['whisper', 'azure', 'cloudflare', 'disabled'],
+        llmProvider: ['gemini', 'gemini-live', 'openai', 'cloudflare'], speechProvider: ['whisper', 'azure', 'cloudflare', 'gemini-live', 'gemini-live-audio', 'disabled'],
         codingLanguage: ['cpp', 'c', 'python', 'java', 'javascript', 'go'], activeSkill: skills.map(skill => skill.id),
         whisperDevice: ['auto', 'cpu', 'cuda'], whisperCaptureMode: ['vad', 'manual'], whisperResponseTarget: ['chat', 'overlay', 'both'],
         cloudflareWhisperModel: ['@cf/openai/whisper', '@cf/openai/whisper-large-v3-turbo']
@@ -1662,8 +1712,9 @@ class ApplicationController {
       const updates = {};
       for (const [field, envKey] of Object.entries(mapping)) {
         if (settings[field] === undefined) continue;
-        if (!['string', 'number'].includes(typeof settings[field])) throw new Error('Invalid setting: ' + field);
-        const value = String(settings[field]).trim();
+        const raw = field === 'geminiTranscribeLanguages' ? parseTranscribeLanguages(settings[field]).join(',') : settings[field];
+        if (!['string', 'number'].includes(typeof raw)) throw new Error('Invalid setting: ' + field);
+        const value = String(raw).trim();
         if (/[\r\n]/.test(value) || value.length > 4096) throw new Error('Invalid setting: ' + field);
         if (enums[field] && !enums[field].includes(value)) throw new Error('Unsupported setting: ' + field);
         if (field === 'openaiBaseUrl' && value) validateEndpoint(value);
@@ -1671,10 +1722,17 @@ class ApplicationController {
         updates[envKey] = value;
       }
       const changed = Object.keys(updates).filter(key => (process.env[key] || '') !== updates[key]);
-      const audioKeys = changed.filter(key => /^(SPEECH_|AZURE_|WHISPER_|CLOUDFLARE_|SYSTEM_AUDIO_)/.test(key));
+      if ((updates.SPEECH_PROVIDER ?? process.env.SPEECH_PROVIDER) === 'gemini-live-audio' &&
+          (updates.LLM_PROVIDER ?? process.env.LLM_PROVIDER ?? 'gemini') !== 'gemini-live') {
+        throw new Error('Gemini-3.8-Live audio requires Gemini-3.8-Live for answers. Choose another speech provider or select Gemini-3.8-Live in AI Providers.');
+      }
+      const audioKeys = changed.filter(key => /^(SPEECH_|AZURE_|WHISPER_|CLOUDFLARE_|SYSTEM_AUDIO_|GEMINI_TRANSCRIBE_)/.test(key));
+      if (changed.includes('LLM_PROVIDER') && [process.env.LLM_PROVIDER, updates.LLM_PROVIDER].includes('gemini-live')) audioKeys.push('LLM_PROVIDER');
+      if (changed.includes('GEMINI_API_KEY') && ['gemini-live', 'gemini-live-audio'].includes(speechService.provider)) audioKeys.push('GEMINI_API_KEY');
       if (audioKeys.length && (speechService.isRecording || speechService.isProcessingAudio)) throw new Error('Stop audio capture and wait for transcription before changing speech settings.');
       const persistedKeys = this.persistEnvUpdates(updates);
       if (Object.keys(updates).length && !persistedKeys.length) throw new Error('Could not save settings to the configuration file.');
+      if (changed.some(key => ['ACTIVE_SKILL', 'CODING_LANGUAGE'].includes(key))) speechService.cancelLiveRecording?.();
       if (settings.codingLanguage) {
         this.codingLanguage = settings.codingLanguage;
         windowManager.broadcastToAllWindows('coding-language-changed', { language: this.codingLanguage });
@@ -1688,7 +1746,7 @@ class ApplicationController {
       if (settings.appIcon) this.appIcon = settings.appIcon;
       if (settings.selectedIcon) { this.appIcon = settings.selectedIcon; this.updateAppIcon(settings.selectedIcon); }
       if (settings.windowGap !== undefined && Number.isFinite(Number(settings.windowGap))) windowManager.setWindowGap(Number(settings.windowGap));
-      if (changed.some(key => /^(LLM_|GEMINI_|OPENAI_|CLOUDFLARE_)/.test(key))) llmService.initializeClient();
+      if (changed.some(key => key !== 'GEMINI_TRANSCRIBE_LANGUAGES' && /^(LLM_|GEMINI_|OPENAI_|CLOUDFLARE_)/.test(key))) llmService.initializeClient();
       if (audioKeys.length) {
         speechService.initializeClient();
         this.speechAvailable = speechService.isAvailable();

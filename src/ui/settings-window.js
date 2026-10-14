@@ -4,6 +4,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     const providerUI = new ProviderSettings(document.getElementById('aiProviderSettings'));
+    const transcribeLanguages = new GeminiTranscribeSettings(document.getElementById('geminiTranscribeLanguageFields'), () => saveSettings());
     const cloudflareWhisperInput = document.getElementById('cloudflareWhisperModel');
     const systemAudioDeviceInput = document.getElementById('systemAudioDevice');
 
@@ -11,6 +12,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const closeButton = document.getElementById('closeButton');
     const quitButton = document.getElementById('quitButton');
     const speechProviderSelect = document.getElementById('speechProvider');
+    let configuredSpeechProvider = 'whisper';
     const azureKeyInput = document.getElementById('azureKey');
     const azureRegionInput = document.getElementById('azureRegion');
     const whisperCommandInput = document.getElementById('whisperCommand');
@@ -78,9 +80,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // Function to load settings into UI
     const loadSettingsIntoUI = (settings) => {
         providerUI.load(settings);
+        transcribeLanguages.load(settings.geminiTranscribeLanguages || []);
         if (cloudflareWhisperInput) cloudflareWhisperInput.value = settings.cloudflareWhisperModel || "@cf/openai/whisper";
         if (systemAudioDeviceInput) systemAudioDeviceInput.value = settings.systemAudioDevice || "";
-        if (settings.speechProvider && speechProviderSelect) speechProviderSelect.value = settings.speechProvider;
+        if (settings.speechProvider && speechProviderSelect) {
+            configuredSpeechProvider = settings.speechProvider;
+            speechProviderSelect.value = configuredSpeechProvider;
+        }
         // Always set the input value, even if empty, so the user sees what's
         // currently configured (including env-derived defaults). Previously
         // empty strings were skipped which left stale UI values.
@@ -141,6 +147,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Save settings helper function
     const saveSettings = async () => {
         const settings = providerUI.values();
+        if (speechProviderSelect?.value === 'gemini-live') settings.geminiTranscribeLanguages = transcribeLanguages.values();
         if (cloudflareWhisperInput) settings.cloudflareWhisperModel = cloudflareWhisperInput.value;
         if (systemAudioDeviceInput) settings.systemAudioDevice = systemAudioDeviceInput.value;
         if (speechProviderSelect) settings.speechProvider = speechProviderSelect.value;
@@ -164,9 +171,23 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     const updateSpeechFieldStates = () => {
+        if (speechProviderSelect) {
+            const native = speechProviderSelect.querySelector('[value="gemini-live-audio"]');
+            native.disabled = providerUI.provider.value !== 'gemini-live';
+            if (native.disabled && configuredSpeechProvider === 'gemini-live-audio') configuredSpeechProvider = 'gemini-live';
+            speechProviderSelect.value = configuredSpeechProvider;
+        }
         const provider = speechProviderSelect ? speechProviderSelect.value : 'whisper';
+        const audioAnswers = provider === 'gemini-live-audio';
+        const languageFields = document.getElementById('geminiTranscribeLanguageFields');
+        languageFields.hidden = provider !== 'gemini-live' || audioAnswers;
+        languageFields.style.display = languageFields.hidden ? 'none' : '';
         providerUI.setSpeechProvider(provider);
         document.getElementById('cloudflareSpeechFields').hidden = provider !== 'cloudflare';
+        document.getElementById('geminiLiveSpeechFields').hidden = !['gemini-live', 'gemini-live-audio'].includes(provider);
+        document.getElementById('geminiLiveSpeechFields').textContent = audioAnswers
+            ? 'Gemini-3.8-Live receives computer audio, transcribes it and generates answers in the same session. Uses your Gemini API key. Stop recording to change the AI provider.'
+            : 'Gemini-3.5-Transcribe Live streams computer audio to Google. Uses the Gemini API key below and the selected language hints. Restart recording before the ten-minute limit.';
 
         // Show/hide provider-specific field groups instead of just disabling
         // them. This keeps the settings UI clean — only the relevant fields
@@ -179,7 +200,7 @@ document.addEventListener('DOMContentLoaded', () => {
             azureGroup.style.display = provider === 'azure' ? '' : 'none';
         }
         if (whisperGroup) {
-            whisperGroup.style.display = ['whisper', 'cloudflare'].includes(provider) ? '' : 'none';
+            whisperGroup.style.display = ['whisper', 'cloudflare', 'gemini-live', 'gemini-live-audio'].includes(provider) ? '' : 'none';
         }
         if (azureNote) {
             azureNote.style.display = provider === 'azure' ? '' : 'none';
@@ -192,12 +213,15 @@ document.addEventListener('DOMContentLoaded', () => {
         [whisperCommandInput, whisperModelInput, whisperDeviceSelect].forEach(input => {
             if (input) { input.disabled = provider !== 'whisper'; input.closest('.settings-item').hidden = provider !== 'whisper'; }
         });
-        [whisperLanguageInput, whisperCaptureModeSelect, whisperResponseTargetSelect, whisperSegmentMsInput].forEach(input => {
-            if (input) input.disabled = !['whisper', 'cloudflare'].includes(provider);
+        [whisperCaptureModeSelect, whisperResponseTargetSelect].forEach(input => {
+            if (input) input.disabled = !['whisper', 'cloudflare', 'gemini-live', 'gemini-live-audio'].includes(provider);
+        });
+        [whisperLanguageInput, whisperSegmentMsInput].forEach(input => {
+            if (input) { input.disabled = !['whisper', 'cloudflare'].includes(provider); input.closest('.settings-item').hidden = ['gemini-live', 'gemini-live-audio'].includes(provider); }
         });
     };
 
-    providerUI.onChange = saveSettings;
+    providerUI.onChange = () => { updateSpeechFieldStates(); saveSettings(); };
     // Add event listeners for all inputs
     const inputs = [
         azureKeyInput,
@@ -221,6 +245,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (speechProviderSelect) {
         speechProviderSelect.addEventListener('change', () => {
+            configuredSpeechProvider = speechProviderSelect.value;
             updateSpeechFieldStates();
             saveSettings();
         });
