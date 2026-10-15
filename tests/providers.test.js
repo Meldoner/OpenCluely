@@ -189,6 +189,31 @@ test('fetch errors identify proxy failures and deadlines still abort hung connec
     fetchImpl: (_url, options) => new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')))) }), /timeout/);
 });
 
+test('speech cancellation aborts Chromium fetch and native HTTP with the original reason', async t => {
+  const reason = Object.assign(new Error('Speech transcription timed out'), { code: 'TRANSCRIPTION_TIMEOUT' });
+  const controller = new AbortController();
+  let fetchSignal;
+  const task = request('https://api.cloudflare.com/test', { apiKey: 'test', body: {}, signal: controller.signal,
+    fetchImpl: (_url, options) => new Promise((_resolve, reject) => {
+      fetchSignal = options.signal;
+      options.signal.addEventListener('abort', () => reject(new Error('aborted')));
+    }) });
+  controller.abort(reason);
+  await assert.rejects(task, error => error === reason);
+  assert.equal(fetchSignal.aborted, true);
+
+  let fetched = false;
+  await assert.rejects(request('https://api.cloudflare.com/test', { body: {}, signal: controller.signal,
+    fetchImpl: async () => { fetched = true; } }), error => error === reason);
+  assert.equal(fetched, false);
+
+  const baseUrl = await endpoint(t, () => {});
+  const nativeController = new AbortController();
+  const native = request(baseUrl, { apiKey: 'test', body: {}, signal: nativeController.signal });
+  nativeController.abort(reason);
+  await assert.rejects(native, error => error === reason);
+});
+
 test('Cloudflare Whisper sends a WAV directly; Turbo sends base64 and language', async () => {
   const requests = [];
   const context = { module: { exports: {} }, process: { env: {} }, require: name => {

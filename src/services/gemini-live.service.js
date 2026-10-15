@@ -1,6 +1,7 @@
 const { EventEmitter } = require('events');
 const { DEFAULTS, isConfiguredKey } = require('../core/ai-settings');
 const { parse: parseTranscribeLanguages } = require('../core/gemini-transcribe-languages');
+const { parseVocabulary } = require('../core/transcription-vocabulary');
 const sessions = new Set();
 let responseSequence = 0;
 const endpoint = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -22,11 +23,11 @@ class LiveSession extends EventEmitter {
     sessions.add(this);
     return new Promise((resolve, reject) => {
       this.rejectConnect = reject;
-      this.connectTimer = setTimeout(() => this.fail(new Error('Live API setup timed out')), this.timeoutMs);
+      this.connectTimer = setTimeout(() => this.fail(Object.assign(new Error('Live API setup timed out'), { code: 'LIVE_SETUP_TIMEOUT' })), this.timeoutMs);
       this.transport.on('open', () => { if (!this.closed) this.send({ setup: this.setup }); });
       this.transport.on('message', message => {
         if (this.closed) return;
-        if (message.error) { this.fail(new Error(`Live API error (${message.error.code || 'unknown'}); check model access and API key`)); return; }
+        if (message.error) { this.fail(Object.assign(new Error(`Live API error (${message.error.code || 'unknown'}); check model access and API key`), { status: Number(message.error.code) })); return; }
         if (message.setupComplete) {
           clearTimeout(this.connectTimer);
           this.rejectConnect = null;
@@ -36,17 +37,19 @@ class LiveSession extends EventEmitter {
         if (message.goAway) { this.fail(new Error('Live API session limit reached; restart recording')); return; }
         if (message.serverContent) this.emit('content', message.serverContent);
       });
-      this.transport.on('error', () => this.fail(new Error('Live connection failed; check the network, proxy, API key and model access')));
-      this.transport.on('close', code => this.fail(new Error(`Live connection closed (${code || 'unknown'})`)));
+      this.transport.on('error', () => this.fail(Object.assign(new Error('Live connection failed; check the network, proxy, API key and model access'), { code: 'LIVE_CONNECTION_LOST' })));
+      this.transport.on('close', code => this.fail(Object.assign(new Error(`Live connection closed (${code || 'unknown'})`), {
+        code: [1001, 1006, 1011, 1012, 1013].includes(code) ? 'LIVE_CONNECTION_LOST' : 'LIVE_CONNECTION_CLOSED'
+      })));
       try { this.transport.start(`${endpoint}?key=${encodeURIComponent(this.apiKey)}`); }
-      catch (error) { this.fail(new Error('Could not start Live transport')); }
+      catch (error) { this.fail(Object.assign(new Error('Could not start Live transport'), { code: 'LIVE_CONNECTION_LOST' })); }
     });
   }
 
   send(message) {
     if (this.closed) throw new Error('Live session is closed');
     try { this.transport.send(message); }
-    catch (error) { this.fail(new Error('Could not send to Live API')); }
+    catch (error) { this.fail(Object.assign(new Error('Could not send to Live API'), { code: 'LIVE_CONNECTION_LOST' })); }
   }
 
   sendAudio(buffer) {
@@ -139,7 +142,10 @@ function createTranscription(options = {}) {
   return addAudioFinalization(new LiveSession({
     model: `models/${DEFAULTS.geminiLiveTranscribeModel}`,
     generationConfig: { responseModalities: ['TEXT'] },
-    inputAudioTranscription: { languageCodes: parseTranscribeLanguages(options.languageCodes ?? process.env.GEMINI_TRANSCRIBE_LANGUAGES ?? DEFAULTS.geminiTranscribeLanguages) },
+    inputAudioTranscription: {
+      languageCodes: parseTranscribeLanguages(options.languageCodes ?? process.env.GEMINI_TRANSCRIBE_LANGUAGES ?? DEFAULTS.geminiTranscribeLanguages),
+      customVocabulary: parseVocabulary(options.customVocabulary ?? process.env.GEMINI_TRANSCRIBE_VOCABULARY ?? DEFAULTS.geminiTranscribeVocabulary)
+    },
     realtimeInputConfig: { automaticActivityDetection: { disabled: !!options.manual } }
   }, options), options);
 }
@@ -199,4 +205,8 @@ function createAudioConversation(request, options = {}) {
 }
 
 function shutdown() { for (const session of [...sessions]) session.close(); }
-module.exports = { LiveSession, complete, createTranscription, createAudioConversation, shutdown };
+function createRecoveringTranscription(options = {}) {
+  const GeminiTranscriptionRetry = require('./gemini-transcription-retry.service');
+  return new GeminiTranscriptionRetry(() => createTranscription(options), options);
+}
+module.exports = { LiveSession, complete, createTranscription, createRecoveringTranscription, createAudioConversation, shutdown };

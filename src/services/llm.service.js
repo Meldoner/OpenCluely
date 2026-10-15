@@ -39,8 +39,8 @@ class LLMService {
     try {
       this.client = new GoogleGenAI({ apiKey });
       
-      // Use the configured model name (default: gemini-3.5-flash)
-      this.model = config.get('llm.gemini.model');
+      // Read the persisted model selection before the built-in default.
+      this.model = process.env.GEMINI_MODEL || config.get('llm.gemini.model');
       this.isInitialized = true;
       
       logger.info('Gemini AI client initialized successfully', {
@@ -554,13 +554,13 @@ class LLMService {
   buildLiveAudioRequest(activeSkill, programmingLanguage) {
     const sessionManager = require('../managers/session.manager');
     const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
-    return {
+    return this.applyDialogueLanguage({
       systemInstruction: { parts: [{ text: `${skillPrompt}\n\n# Live audio input\nListen directly to the incoming audio and answer the interviewer using the same concise interview style. Use the conversation for follow-ups. If an essential detail is unclear, ask one short clarification. Do not answer silence, filler or recording status messages.` }] },
       contents: sessionManager.getConversationHistory(15)
         .filter(event => ['user', 'model'].includes(event.role) && typeof event.content === 'string' && event.content.trim())
         .map(event => ({ role: event.role, parts: [{ text: event.content.trim() }] })),
       metadata: { skill: activeSkill, programmingLanguage, isTranscriptionResponse: true }
-    };
+    });
   }
 
   buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage) {
@@ -805,7 +805,18 @@ Do not respond to recording status messages or filler with a technical lecture.`
     return String(text || '').trim();
   }
 
+  applyDialogueLanguage(request) {
+    const instruction = require('../core/dialogue-languages').getDialogueInstruction(process.env);
+    if (!instruction) return request;
+    const parts = request.systemInstruction?.parts || [];
+    if (!parts.some(part => part.text === instruction)) {
+      request.systemInstruction = { ...request.systemInstruction, parts: [...parts, { text: instruction }] };
+    }
+    return request;
+  }
+
   async executeRequest(geminiRequest) {
+    this.applyDialogueLanguage(geminiRequest);
     if (this.provider === 'gemini-live') return require('./gemini-live.service').complete(geminiRequest);
     if (this.provider !== 'gemini') return compatible.complete(geminiRequest);
     const maxRetries = config.get('llm.gemini.maxRetries');
@@ -1024,6 +1035,7 @@ Do not respond to recording status messages or filler with a technical lecture.`
    * for each chunk.
    */
   async executeStreamingRequest(geminiRequest, onDelta) {
+    this.applyDialogueLanguage(geminiRequest);
     if (this.provider === 'gemini-live') return require('./gemini-live.service').complete(geminiRequest, onDelta);
     if (this.provider !== 'gemini') return compatible.complete(geminiRequest, onDelta);
     const maxRetries = config.get('llm.gemini.maxRetries');
@@ -1514,11 +1526,12 @@ Do not respond to recording status messages or filler with a technical lecture.`
   }
 
   async executeAlternativeRequest(geminiRequest) {
+    this.applyDialogueLanguage(geminiRequest);
     if (this.provider === 'gemini-live') return require('./gemini-live.service').complete(geminiRequest);
     if (this.provider !== 'gemini') return compatible.complete(geminiRequest);
     const https = require('https');
     const apiKey = config.getApiKey('GEMINI');
-    const primaryModel = config.get('llm.gemini.model');
+    const primaryModel = this.model || config.get('llm.gemini.model');
     const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
     const modelsToTry = [primaryModel, ...fallbackModels];
 

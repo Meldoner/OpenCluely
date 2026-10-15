@@ -3,10 +3,13 @@ document.addEventListener('DOMContentLoaded', () => {
         info: (...args) => console.log('[SettingsWindowUI]', ...args)
     };
 
-    const providerUI = new ProviderSettings(document.getElementById('aiProviderSettings'));
-    const transcribeLanguages = new GeminiTranscribeSettings(document.getElementById('geminiTranscribeLanguageFields'), () => saveSettings());
+    const providerUI = new ProviderSettings(document.getElementById('aiProviderSettings'), undefined, {
+        compact: true, speechContainer: document.getElementById('speechCredentials')
+    });
+    const dialogueLanguages = new GeminiTranscribeSettings(document.getElementById('dialogueLanguageFields'), () => saveSettings(), { global: true });
     const cloudflareWhisperInput = document.getElementById('cloudflareWhisperModel');
     const systemAudioDeviceInput = document.getElementById('systemAudioDevice');
+    const vocabularyInput = document.getElementById('geminiTranscribeVocabulary');
 
     // Get DOM elements
     const closeButton = document.getElementById('closeButton');
@@ -17,7 +20,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const azureRegionInput = document.getElementById('azureRegion');
     const whisperCommandInput = document.getElementById('whisperCommand');
     const whisperModelInput = document.getElementById('whisperModel');
-    const whisperLanguageInput = document.getElementById('whisperLanguage');
     const whisperDeviceSelect = document.getElementById('whisperDevice');
     const whisperCaptureModeSelect = document.getElementById('whisperCaptureMode');
     const whisperResponseTargetSelect = document.getElementById('whisperResponseTarget');
@@ -80,7 +82,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // Function to load settings into UI
     const loadSettingsIntoUI = (settings) => {
         providerUI.load(settings);
-        transcribeLanguages.load(settings.geminiTranscribeLanguages || []);
+        const vocabulary = settings.geminiTranscribeVocabulary ?? ['KVCache', 'KV cache', 'key-value cache'];
+        vocabularyInput.value = Array.isArray(vocabulary) ? vocabulary.join(', ') : vocabulary;
+        dialogueLanguages.load(settings.dialogueLanguages ?? settings.geminiTranscribeLanguages ?? []);
         if (cloudflareWhisperInput) cloudflareWhisperInput.value = settings.cloudflareWhisperModel || "@cf/openai/whisper";
         if (systemAudioDeviceInput) systemAudioDeviceInput.value = settings.systemAudioDevice || "";
         if (settings.speechProvider && speechProviderSelect) {
@@ -94,7 +98,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (azureRegionInput) azureRegionInput.value = settings.azureRegion || '';
         if (whisperCommandInput) whisperCommandInput.value = settings.whisperCommand || '';
         if (whisperModelInput) whisperModelInput.value = settings.whisperModel || '';
-        if (whisperLanguageInput) whisperLanguageInput.value = settings.whisperLanguage || '';
         if (whisperDeviceSelect) whisperDeviceSelect.value = settings.whisperDevice || 'auto';
         if (whisperCaptureModeSelect) whisperCaptureModeSelect.value = settings.whisperCaptureMode || 'vad';
         if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
@@ -147,7 +150,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Save settings helper function
     const saveSettings = async () => {
         const settings = providerUI.values();
-        if (speechProviderSelect?.value === 'gemini-live') settings.geminiTranscribeLanguages = transcribeLanguages.values();
+        settings.dialogueLanguages = dialogueLanguages.values();
+        settings.geminiTranscribeVocabulary = vocabularyInput.value;
         if (cloudflareWhisperInput) settings.cloudflareWhisperModel = cloudflareWhisperInput.value;
         if (systemAudioDeviceInput) settings.systemAudioDevice = systemAudioDeviceInput.value;
         if (speechProviderSelect) settings.speechProvider = speechProviderSelect.value;
@@ -155,7 +159,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (azureRegionInput) settings.azureRegion = azureRegionInput.value;
         if (whisperCommandInput) settings.whisperCommand = whisperCommandInput.value;
         if (whisperModelInput) settings.whisperModel = whisperModelInput.value;
-        if (whisperLanguageInput) settings.whisperLanguage = whisperLanguageInput.value;
         if (whisperDeviceSelect) settings.whisperDevice = whisperDeviceSelect.value;
         if (whisperCaptureModeSelect) settings.whisperCaptureMode = whisperCaptureModeSelect.value;
         if (whisperResponseTargetSelect) settings.whisperResponseTarget = whisperResponseTargetSelect.value;
@@ -179,15 +182,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const provider = speechProviderSelect ? speechProviderSelect.value : 'whisper';
         const audioAnswers = provider === 'gemini-live-audio';
-        const languageFields = document.getElementById('geminiTranscribeLanguageFields');
-        languageFields.hidden = provider !== 'gemini-live' || audioAnswers;
-        languageFields.style.display = languageFields.hidden ? 'none' : '';
+        document.getElementById('geminiVocabularyFields').hidden = provider !== 'gemini-live';
         providerUI.setSpeechProvider(provider);
         document.getElementById('cloudflareSpeechFields').hidden = provider !== 'cloudflare';
         document.getElementById('geminiLiveSpeechFields').hidden = !['gemini-live', 'gemini-live-audio'].includes(provider);
         document.getElementById('geminiLiveSpeechFields').textContent = audioAnswers
             ? 'Gemini-3.8-Live receives computer audio, transcribes it and generates answers in the same session. Uses your Gemini API key. Stop recording to change the AI provider.'
-            : 'Gemini-3.5-Transcribe Live streams computer audio to Google. Uses the Gemini API key below and the selected language hints. Restart recording before the ten-minute limit.';
+            : 'Gemini-3.5-Transcribe Live streams computer audio to Google. Uses the Gemini API key and the global dialogue languages. Restart recording before the ten-minute limit.';
 
         // Show/hide provider-specific field groups instead of just disabling
         // them. This keeps the settings UI clean — only the relevant fields
@@ -216,7 +217,7 @@ document.addEventListener('DOMContentLoaded', () => {
         [whisperCaptureModeSelect, whisperResponseTargetSelect].forEach(input => {
             if (input) input.disabled = !['whisper', 'cloudflare', 'gemini-live', 'gemini-live-audio'].includes(provider);
         });
-        [whisperLanguageInput, whisperSegmentMsInput].forEach(input => {
+        [whisperSegmentMsInput].forEach(input => {
             if (input) { input.disabled = !['whisper', 'cloudflare'].includes(provider); input.closest('.settings-item').hidden = ['gemini-live', 'gemini-live-audio'].includes(provider); }
         });
     };
@@ -228,12 +229,11 @@ document.addEventListener('DOMContentLoaded', () => {
         azureRegionInput,
         whisperCommandInput,
         whisperModelInput,
-        whisperLanguageInput,
         whisperDeviceSelect,
         whisperCaptureModeSelect,
         whisperResponseTargetSelect,
         whisperSegmentMsInput,
-        windowGapInput, cloudflareWhisperInput, systemAudioDeviceInput
+        windowGapInput, cloudflareWhisperInput, systemAudioDeviceInput, vocabularyInput
     ];
 
     inputs.forEach(input => {

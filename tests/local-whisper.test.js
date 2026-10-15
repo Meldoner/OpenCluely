@@ -11,7 +11,7 @@ function localSpeech(device = 'cuda', worker = null) {
   const calls = [];
   const context = {
     EventEmitter, process: { env: { WHISPER_DEVICE: device }, platform: 'win32' },
-    path, os, Buffer,
+    path, os, Buffer, setTimeout, clearTimeout,
     fs: { mkdtempSync: () => 'test-output', existsSync: () => true, readFileSync: () => 'Привет' },
     config: { get: () => null }, logger: { info() {}, warn() {} },
     spawn(command, args, options) {
@@ -27,7 +27,7 @@ function localSpeech(device = 'cuda', worker = null) {
   service.runtimeSettings = {};
   service.provider = 'whisper';
   service.whisperCommand = { command: 'C:\\custom-venv\\Scripts\\whisper.exe', baseArgs: [] };
-  service.whisperWorker = worker || { isConfigured: () => false };
+  service.whisperWorker = { close() {}, ...(worker || { isConfigured: () => false }) };
   service._getWhisperModel = () => 'small';
   service._getWhisperLanguage = () => 'ru';
   service._getWhisperModelDir = () => 'test-models';
@@ -91,4 +91,28 @@ test('worker Python follows the selected CLI environment before a managed instal
   assert.equal(service._getWhisperPythonPath(), 'C:\\override\\python.exe');
   service.runtimeSettings.whisperDevice = 'cpu';
   assert.equal(service._getWhisperDevice(), 'cpu');
+});
+
+test('CLI timeout and cancellation kill the child and release the awaiting transcription', async () => {
+  for (const cancel of [false, true]) {
+    const { service, context } = localSpeech('cpu');
+    const child = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), kill() { this.killed = true; } });
+    context.spawn = () => child;
+    service._getTranscriptionTimeoutMs = () => 15;
+    const controller = new AbortController();
+    const task = service._transcribeWhisperFile('test.wav', { signal: controller.signal });
+    if (cancel) controller.abort(Object.assign(new Error('cancelled'), { code: 'ABORT_ERR' }));
+    await assert.rejects(task, cancel ? /cancelled/ : /timed out/);
+    assert.equal(child.killed, true);
+    child.emit('close', 0); // A late exit must not turn a failure into success.
+  }
+});
+
+test('a worker timeout is surfaced without starting a second unbounded CLI attempt', async () => {
+  const { service, calls } = localSpeech('cpu', {
+    isConfigured: () => true,
+    transcribe: async () => { throw Object.assign(new Error('timed out'), { code: 'WHISPER_TIMEOUT' }); }
+  });
+  await assert.rejects(service._transcribeWhisperFile('test.wav'), /timed out/);
+  assert.equal(calls.length, 0);
 });

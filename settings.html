@@ -173,6 +173,14 @@
             border-color: rgba(255, 255, 255, 0.3);
         }
 
+        [hidden] { display: none !important; }
+
+        .settings-advanced { margin-top: 12px; }
+        .settings-advanced > summary { width: fit-content; }
+        .settings-advanced[open] > summary { margin-bottom: 12px; }
+        .settings-advanced > summary::before { content: '+'; }
+        .settings-advanced[open] > summary::before { content: '\2212'; }
+
         /* Stealth scrollbar */
         ::-webkit-scrollbar {
             width: 2px;
@@ -292,6 +300,7 @@
         </div>
         
         <div class="settings-content">
+            <h1 class="settings-section-title">Main Settings</h1>
             <div class="settings-section">
                 <div class="settings-section-title">
                     <i class="fas fa-code"></i>
@@ -326,9 +335,143 @@
 <option value="ai-engineer">AI Engineer</option>
 </select>
                     </div>
+                    <div id="dialogueLanguageFields"></div>
                 </div>
             </div>
 
+            <div class="settings-section">
+                <div class="settings-section-title"><i class="fas fa-robot"></i> Answer Model</div>
+                <div class="settings-section-content" id="aiProviderSettings"></div>
+            </div>
+
+            <div class="settings-section">
+                <div class="settings-section-title">
+                    <i class="fas fa-microphone"></i>
+                    Transcription Model
+                </div>
+                <div class="settings-section-content">
+                    <div class="settings-item">
+                        <div>
+                            <div class="settings-item-label">Transcription model</div>
+                            <div class="settings-item-description">Choose Azure, Whisper or Gemini Live transcription</div>
+                        </div>
+                        <select class="input-field" id="speechProvider">
+                            <option value="azure">Azure Speech</option>
+                            <option value="whisper">Local Whisper</option>
+                            <option value="cloudflare">Cloudflare Whisper</option>
+                            <option value="gemini-live">Gemini-3.5-Transcribe Live</option>
+                            <option value="gemini-live-audio">Gemini-3.8-Live (audio + answers)</option>
+                            <option value="disabled">Disabled</option>
+                        </select>
+                    </div>
+
+                    <div class="settings-item" id="localWhisperModelFields">
+                        <div>
+                            <div class="settings-item-label">Whisper Model</div>
+                            <div class="settings-item-description">Local model name used by the Whisper CLI</div>
+                        </div>
+                        <input type="text" class="input-field" id="whisperModel" placeholder="small">
+                    </div>
+                    <div id="cloudflareSpeechFields" class="settings-item">
+                        <div><div class="settings-item-label">Cloudflare Whisper model</div><div class="settings-item-description">Cloudflare transcription model</div></div>
+                        <select class="input-field" id="cloudflareWhisperModel"><option value="@cf/openai/whisper">Whisper</option><option value="@cf/openai/whisper-large-v3-turbo">Whisper Large v3 Turbo</option></select>
+                    </div>
+                    <details class="settings-advanced" id="speechAdvanced">
+                        <summary class="btn">Keys and additional settings</summary>
+                        <div id="speechCredentials"></div>
+                        <div class="settings-item" id="geminiVocabularyFields" hidden>
+                            <div class="settings-stack">
+                                <label class="settings-item-label" for="geminiTranscribeVocabulary">Technical vocabulary</label>
+                                <div class="settings-item-description">Gemini Transcribe hints: up to 100 comma-separated terms, e.g. KVCache, Kubernetes, PyTorch. Use the intended spelling. Applied on the next recording.</div>
+                                <input class="input-field" id="geminiTranscribeVocabulary" maxlength="4096" style="max-width:100%;" placeholder="KVCache, KV cache, key-value cache">
+                            </div>
+                        </div>
+                        <div class="settings-note">Audio source: computer output. Windows uses system loopback; Linux uses the default output monitor. macOS requires a routed virtual loopback device.</div>
+                        <div id="geminiLiveSpeechFields" class="settings-note" hidden>Gemini-3.5-Transcribe Live streams computer audio to Google. Uses the Gemini API key in additional settings below and detects the language automatically. Sessions last up to 10 minutes; restart recording when the limit is reached.</div>
+                        <div class="settings-item">
+                            <div><div class="settings-item-label">macOS loopback device name</div><div class="settings-item-description">Exact input label, e.g. BlackHole 2ch. Route computer output to this virtual device.</div></div>
+                            <input class="input-field" id="systemAudioDevice" placeholder="BlackHole 2ch">
+                        </div>
+                        <!-- Azure fields (shown only when Azure is selected) -->
+                        <div id="azureFields" class="settings-group">
+                            <div class="settings-item">
+                                <div>
+                                    <div class="settings-item-label">Azure Speech Key</div>
+                                    <div class="settings-item-description">Your Azure Cognitive Services API key</div>
+                                </div>
+                                <input type="password" class="input-field" id="azureKey" placeholder="Enter your Azure key">
+                            </div>
+                            <div class="settings-item">
+                                <div>
+                                    <div class="settings-item-label">Azure Region</div>
+                                    <div class="settings-item-description">Your Azure service region</div>
+                                </div>
+                                <input type="text" class="input-field" id="azureRegion" placeholder="e.g. eastus">
+                            </div>
+                        </div>
+
+                        <!-- Whisper fields (shown only when Whisper is selected) -->
+                        <div id="whisperFields" class="settings-group">
+                            <div class="settings-item">
+                                <div class="settings-stack">
+                                    <div>
+                                        <div class="settings-item-label">Whisper Command</div>
+                                        <div class="settings-item-description">CLI command for local Whisper, such as <code>whisper</code> or <code>python3 -m whisper</code></div>
+                                    </div>
+                                    <input type="text" class="input-field" id="whisperCommand" placeholder="whisper" style="max-width: 100%;">
+                                </div>
+                            </div>
+                            <div class="settings-item">
+                                <div>
+                                    <div class="settings-item-label">Compute Device</div>
+                                    <div class="settings-item-description">Automatically use CUDA when available, or force CPU/GPU</div>
+                                </div>
+                                <select class="input-field" id="whisperDevice">
+                                    <option value="auto">Auto</option>
+                                    <option value="cpu">CPU</option>
+                                    <option value="cuda">CUDA</option>
+                                </select>
+                            </div>
+                            <div class="settings-item">
+                                <div>
+                                    <div class="settings-item-label">Capture Mode</div>
+                                    <div class="settings-item-description">Manual records until you press stop; VAD detects natural pauses</div>
+                                </div>
+                                <select class="input-field" id="whisperCaptureMode">
+                                    <option value="vad">Automatic (VAD)</option>
+                                    <option value="manual">Manual start/stop</option>
+                                </select>
+                            </div>
+                            <div class="settings-item">
+                                <div>
+                                    <div class="settings-item-label">Voice Response Target</div>
+                                    <div class="settings-item-description">Choose where answers generated from speech are displayed</div>
+                                </div>
+                                <select class="input-field" id="whisperResponseTarget">
+                                    <option value="both">Chat and overlay</option>
+                                    <option value="chat">Chat only</option>
+                                    <option value="overlay">Overlay only</option>
+                                </select>
+                            </div>
+                            <div class="settings-item">
+                                <div>
+                                    <div class="settings-item-label">Whisper Segment Length</div>
+                                    <div class="settings-item-description">Chunk size in milliseconds for local transcription</div>
+                                </div>
+                                <input type="number" class="input-field" id="whisperSegmentMs" placeholder="4000" min="2000" step="500">
+                            </div>
+                            <div class="settings-note">
+                                Local Whisper runs on this machine and needs a Whisper CLI installed. These settings apply immediately for the current app session and are also written back to <code>.env</code> so they persist across restarts.
+                            </div>
+                        </div>
+
+                        <div id="azureFieldsNote" class="settings-note">
+                            Azure credentials apply immediately and are also written back to <code>.env</code> so they persist across restarts.
+                        </div>
+                    </details>
+                </div>
+            </div>
+            
             <div class="settings-section">
                 <div class="settings-section-title">
                     <i class="fas fa-icons"></i>
@@ -350,136 +493,6 @@
                         </div>
                     </div>
                 </div>
-            </div>
-
-            <div class="settings-section">
-                <div class="settings-section-title">
-                    <i class="fas fa-microphone"></i>
-                    Speech Recognition
-                </div>
-                <div class="settings-section-content">
-                    <div class="settings-item">
-                        <div>
-                            <div class="settings-item-label">Speech Provider</div>
-                            <div class="settings-item-description">Choose Azure, Whisper or Gemini Live transcription</div>
-                        </div>
-                        <select class="input-field" id="speechProvider">
-                            <option value="azure">Azure Speech</option>
-                            <option value="whisper">Local Whisper</option>
-                            <option value="cloudflare">Cloudflare Whisper</option>
-                            <option value="gemini-live">Gemini-3.5-Transcribe Live</option>
-                            <option value="gemini-live-audio">Gemini-3.8-Live (audio + answers)</option>
-                            <option value="disabled">Disabled</option>
-                        </select>
-                    </div>
-
-                    <div class="settings-note">Audio source: computer output. Windows uses system loopback; Linux uses the default output monitor. macOS requires a routed virtual loopback device.</div>
-                    <div id="geminiLiveSpeechFields" class="settings-note" hidden>Gemini-3.5-Transcribe Live streams computer audio to Google. Uses the Gemini API key in AI Providers below and detects the language automatically. Sessions last up to 10 minutes; restart recording when the limit is reached.</div>
-                    <div id="geminiTranscribeLanguageFields" class="settings-group" hidden></div>
-                    <div class="settings-item">
-                        <div><div class="settings-item-label">macOS loopback device name</div><div class="settings-item-description">Exact input label, e.g. BlackHole 2ch. Route computer output to this virtual device.</div></div>
-                        <input class="input-field" id="systemAudioDevice" placeholder="BlackHole 2ch">
-                    </div>
-                    <div id="cloudflareSpeechFields" class="settings-item">
-                        <div><div class="settings-item-label">Cloudflare Whisper model</div><div class="settings-item-description">Uses the Account ID and API Token in AI Providers below</div></div>
-                        <select class="input-field" id="cloudflareWhisperModel"><option value="@cf/openai/whisper">Whisper</option><option value="@cf/openai/whisper-large-v3-turbo">Whisper Large v3 Turbo</option></select>
-                    </div>
-                    <!-- Azure fields (shown only when Azure is selected) -->
-                    <div id="azureFields" class="settings-group">
-                        <div class="settings-item">
-                            <div>
-                                <div class="settings-item-label">Azure Speech Key</div>
-                                <div class="settings-item-description">Your Azure Cognitive Services API key</div>
-                            </div>
-                            <input type="password" class="input-field" id="azureKey" placeholder="Enter your Azure key">
-                        </div>
-                        <div class="settings-item">
-                            <div>
-                                <div class="settings-item-label">Azure Region</div>
-                                <div class="settings-item-description">Your Azure service region</div>
-                            </div>
-                            <input type="text" class="input-field" id="azureRegion" placeholder="e.g. eastus">
-                        </div>
-                    </div>
-
-                    <!-- Whisper fields (shown only when Whisper is selected) -->
-                    <div id="whisperFields" class="settings-group">
-                        <div class="settings-item">
-                            <div class="settings-stack">
-                                <div>
-                                    <div class="settings-item-label">Whisper Command</div>
-                                    <div class="settings-item-description">CLI command for local Whisper, such as <code>whisper</code> or <code>python3 -m whisper</code></div>
-                                </div>
-                                <input type="text" class="input-field" id="whisperCommand" placeholder="whisper" style="max-width: 100%;">
-                            </div>
-                        </div>
-                        <div class="settings-item">
-                            <div>
-                                <div class="settings-item-label">Whisper Model</div>
-                                <div class="settings-item-description">Local model name used by the Whisper CLI</div>
-                            </div>
-                            <input type="text" class="input-field" id="whisperModel" placeholder="small">
-                        </div>
-                        <div class="settings-item">
-                            <div>
-                                <div class="settings-item-label">Whisper Language</div>
-                                <div class="settings-item-description">Use auto or a language code such as ru (Russian). Cloudflare Turbo accepts an explicit language; standard Cloudflare Whisper detects it automatically.</div>
-                            </div>
-                            <input type="text" class="input-field" id="whisperLanguage" placeholder="auto">
-                        </div>
-                        <div class="settings-item">
-                            <div>
-                                <div class="settings-item-label">Compute Device</div>
-                                <div class="settings-item-description">Automatically use CUDA when available, or force CPU/GPU</div>
-                            </div>
-                            <select class="input-field" id="whisperDevice">
-                                <option value="auto">Auto</option>
-                                <option value="cpu">CPU</option>
-                                <option value="cuda">CUDA</option>
-                            </select>
-                        </div>
-                        <div class="settings-item">
-                            <div>
-                                <div class="settings-item-label">Capture Mode</div>
-                                <div class="settings-item-description">Manual records until you press stop; VAD detects natural pauses</div>
-                            </div>
-                            <select class="input-field" id="whisperCaptureMode">
-                                <option value="vad">Automatic (VAD)</option>
-                                <option value="manual">Manual start/stop</option>
-                            </select>
-                        </div>
-                        <div class="settings-item">
-                            <div>
-                                <div class="settings-item-label">Voice Response Target</div>
-                                <div class="settings-item-description">Choose where answers generated from speech are displayed</div>
-                            </div>
-                            <select class="input-field" id="whisperResponseTarget">
-                                <option value="both">Chat and overlay</option>
-                                <option value="chat">Chat only</option>
-                                <option value="overlay">Overlay only</option>
-                            </select>
-                        </div>
-                        <div class="settings-item">
-                            <div>
-                                <div class="settings-item-label">Whisper Segment Length</div>
-                                <div class="settings-item-description">Chunk size in milliseconds for local transcription</div>
-                            </div>
-                            <input type="number" class="input-field" id="whisperSegmentMs" placeholder="4000" min="2000" step="500">
-                        </div>
-                        <div class="settings-note">
-                            Local Whisper runs on this machine and needs a Whisper CLI installed. These settings apply immediately for the current app session and are also written back to <code>.env</code> so they persist across restarts.
-                        </div>
-                    </div>
-
-                    <div id="azureFieldsNote" class="settings-note">
-                        Azure credentials apply immediately and are also written back to <code>.env</code> so they persist across restarts.
-                    </div>
-                </div>
-            </div>
-            
-            <div class="settings-section">
-                <div class="settings-section-title"><i class="fas fa-robot"></i> AI Providers</div>
-                <div class="settings-section-content" id="aiProviderSettings"></div>
             </div>
 
             <div class="settings-section">

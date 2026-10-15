@@ -349,9 +349,9 @@ class WindowManager {
         backgroundColor: '#00000000',
   // Allow resizing so users can adjust width; we will lock height in handlers
   resizable: true,
-    // Keep the original max width as cap; allow small min width so it can collapse to one icon
+    // Content resizing applies the current monitor's work area as the limit.
     minWidth: 60,
-    maxWidth: this.windowConfigs.main.width,
+    maxWidth: 1200,
         minimizable: false,
         maximizable: false,
         closable: false,
@@ -497,7 +497,7 @@ class WindowManager {
             event.preventDefault();
             // Enforce width within min/max bounds
             const minW = 60;
-            const maxW = this.windowConfigs.main.width;
+            const maxW = Math.min(1200, screen.getDisplayMatching(window.getBounds()).workArea.width);
             const desiredW = Math.max(minW, Math.min(maxW, Math.round(newBounds.width || minW)));
             window.setContentSize(desiredW, Math.max(1, currentContentHeight));
           } catch (e) {
@@ -506,7 +506,7 @@ class WindowManager {
               const [__w, currentWindowHeight] = window.getSize();
               event.preventDefault();
               const minW = 60;
-              const maxW = this.windowConfigs.main.width;
+              const maxW = Math.min(1200, screen.getDisplayMatching(window.getBounds()).workArea.width);
               const desiredW = Math.max(minW, Math.min(maxW, Math.round(newBounds.width || minW)));
               window.setSize(desiredW, Math.max(1, currentWindowHeight));
             } catch { /* noop */ }

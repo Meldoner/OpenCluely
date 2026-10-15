@@ -1,5 +1,6 @@
 const path = require('path');
 const os = require('os');
+const { DEFAULTS } = require('./ai-settings');
 
 class ConfigManager {
   constructor() {
@@ -40,7 +41,7 @@ class ConfigManager {
 
       llm: {
         gemini: {
-          model: 'gemini-3.1-flash-lite',
+          model: DEFAULTS.geminiModel,
           fallbackModels: ['gemini-2.5-flash-lite', 'gemini-3.5-flash'],
           maxRetries: 3,
           timeout: 30000,
@@ -67,8 +68,7 @@ class ConfigManager {
         whisper: {
           model: 'small',
           language: 'auto',
-          // segmentMs is the legacy fixed-window size and now acts as the
-          // hard upper bound for a single utterance when VAD is enabled.
+          // Fixed-window size used when VAD is disabled.
           segmentMs: 4000,
           // Voice-activity-detection driven segmentation. Instead of cutting
           // audio on a blind timer (which splits sentences mid-word), we flush
@@ -78,8 +78,8 @@ class ConfigManager {
           // Trailing silence (ms) that ends an utterance and triggers a flush.
           silenceHangoverMs: 700,
           // Minimum accumulated speech (ms) before a pause counts as an
-          // utterance — guards against coughs/clicks producing empty flushes.
-          minUtteranceMs: 350,
+          // utterance. Keep short words while rejecting isolated clicks.
+          minUtteranceMs: 80,
           // Hard cap (ms): force-flush a long monologue even without a pause.
           maxUtteranceMs: 15000,
           // Pre-roll (ms) of audio kept before speech onset so the first
@@ -87,7 +87,7 @@ class ConfigManager {
           preRollMs: 300,
           // Absolute RMS energy floor (normalized 0..1). Energy below this is
           // always treated as silence regardless of the adaptive noise floor.
-          vadEnergyFloor: 0.008
+          vadEnergyFloor: 0.0015
         }
       },
 

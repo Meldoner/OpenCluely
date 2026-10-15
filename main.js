@@ -1,7 +1,7 @@
 const path = require("path");
 const fs = require("fs");
 const { fileURLToPath } = require("url");
-const { app, BrowserWindow, globalShortcut, session, ipcMain } = require("electron");
+const { app, BrowserWindow, globalShortcut, session, ipcMain, screen } = require("electron");
 
 // ── Resolve a stable .env location ──
 // In packaged builds process.cwd() is unstable and frequently read-only
@@ -111,6 +111,8 @@ const sessionManager = require("./src/managers/session.manager");
 const skills = require('./src/core/skills');
 const { DEFAULTS } = require('./src/core/ai-settings');
 const { parse: parseTranscribeLanguages } = require('./src/core/gemini-transcribe-languages');
+const { getDialogueLanguages } = require('./src/core/dialogue-languages');
+const { parseVocabulary } = require('./src/core/transcription-vocabulary');
 const { validateEndpoint } = require('./src/services/ai-http');
 const { configureSystemAudioSession } = require('./src/core/system-audio-session');
 
@@ -579,18 +581,26 @@ class ApplicationController {
 
     ipcMain.handle("resize-window", (event, { width, height }) => {
       const mainWindow = windowManager.getWindow("main");
-      if (mainWindow) {
-        // Enforce horizontal constraints: min ~one icon, max original width
+      if (mainWindow && event.sender === mainWindow.webContents &&
+          Number.isFinite(width) && Number.isFinite(height)) {
+        // Fit the actual toolbar instead of clipping its right-hand actions.
         const minW = 60;
-        const maxW = windowManager.windowConfigs?.main?.width || 520;
+        const bounds = mainWindow.getBounds();
+        const display = screen.getDisplayMatching(bounds);
+        const maxW = Math.min(1200, display.workArea.width);
         const clampedWidth = Math.max(minW, Math.min(maxW, Math.round(width || minW)));
+        const clampedHeight = Math.max(1, Math.min(display.workArea.height, Math.round(height)));
         try {
           // Match content size to the DOM so no extra transparent area remains
-          mainWindow.setContentSize(Math.max(1, clampedWidth), Math.max(1, Math.round(height)));
+          mainWindow.setContentSize(clampedWidth, clampedHeight);
         } catch (e) {
           // Fallback in case setContentSize isn’t available on some platform
-          mainWindow.setSize(Math.max(1, clampedWidth), Math.max(1, Math.round(height)));
+          mainWindow.setSize(clampedWidth, clampedHeight);
         }
+        mainWindow.setPosition(
+          Math.max(display.workArea.x, Math.min(bounds.x, display.workArea.x + display.workArea.width - clampedWidth)),
+          Math.max(display.workArea.y, Math.min(bounds.y, display.workArea.y + display.workArea.height - clampedHeight))
+        );
         logger.debug("Main window resized (content)", { width: clampedWidth, height });
       }
       return { success: true };
@@ -1360,12 +1370,7 @@ class ApplicationController {
       }
 
       const cleanText = text.trim();
-      if (cleanText.length < 2) {
-        logger.debug("Skipping LLM processing for very short transcription", {
-          text: cleanText
-        });
-        return;
-      }
+      if (!/[\p{L}\p{N}]/u.test(cleanText)) return;
 
       logger.info("Processing transcription with intelligent LLM response", {
         skill: this.activeSkill,
@@ -1654,6 +1659,7 @@ class ApplicationController {
     // distinguish "unset" from "stale value from a previous load".
     return {
       codingLanguage: this.codingLanguage || "cpp",
+      dialogueLanguages: getDialogueLanguages(process.env),
       activeSkill: this.activeSkill || "dsa",
       appIcon: this.appIcon || "terminal",
       selectedIcon: this.appIcon || "terminal",
@@ -1671,7 +1677,9 @@ class ApplicationController {
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
       geminiKey: process.env.GEMINI_API_KEY || "",
+      geminiModel: process.env.GEMINI_MODEL || DEFAULTS.geminiModel,
       geminiTranscribeLanguages: parseTranscribeLanguages(process.env.GEMINI_TRANSCRIBE_LANGUAGES ?? DEFAULTS.geminiTranscribeLanguages),
+      geminiTranscribeVocabulary: parseVocabulary(process.env.GEMINI_TRANSCRIBE_VOCABULARY ?? DEFAULTS.geminiTranscribeVocabulary),
       llmProvider: process.env.LLM_PROVIDER || 'gemini',
       openaiKey: process.env.OPENAI_API_KEY || '',
       openaiModel: process.env.OPENAI_MODEL || DEFAULTS.openaiModel,
@@ -1691,8 +1699,10 @@ class ApplicationController {
     try {
       if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Invalid settings');
       const mapping = {
-        llmProvider: 'LLM_PROVIDER', geminiKey: 'GEMINI_API_KEY',
+        llmProvider: 'LLM_PROVIDER', geminiKey: 'GEMINI_API_KEY', geminiModel: 'GEMINI_MODEL',
+        dialogueLanguages: 'DIALOGUE_LANGUAGES',
         geminiTranscribeLanguages: 'GEMINI_TRANSCRIBE_LANGUAGES',
+        geminiTranscribeVocabulary: 'GEMINI_TRANSCRIBE_VOCABULARY',
         openaiKey: 'OPENAI_API_KEY', openaiModel: 'OPENAI_MODEL', openaiBaseUrl: 'OPENAI_BASE_URL',
         cloudflareAccountId: 'CLOUDFLARE_ACCOUNT_ID', cloudflareToken: 'CLOUDFLARE_API_TOKEN',
         cloudflareModel: 'CLOUDFLARE_MODEL', cloudflareWhisperModel: 'CLOUDFLARE_WHISPER_MODEL',
@@ -1712,7 +1722,8 @@ class ApplicationController {
       const updates = {};
       for (const [field, envKey] of Object.entries(mapping)) {
         if (settings[field] === undefined) continue;
-        const raw = field === 'geminiTranscribeLanguages' ? parseTranscribeLanguages(settings[field]).join(',') : settings[field];
+        const raw = field === 'geminiTranscribeVocabulary' ? parseVocabulary(settings[field]).join(',')
+          : ['dialogueLanguages', 'geminiTranscribeLanguages'].includes(field) ? parseTranscribeLanguages(settings[field]).join(',') : settings[field];
         if (!['string', 'number'].includes(typeof raw)) throw new Error('Invalid setting: ' + field);
         const value = String(raw).trim();
         if (/[\r\n]/.test(value) || value.length > 4096) throw new Error('Invalid setting: ' + field);
@@ -1727,6 +1738,8 @@ class ApplicationController {
         throw new Error('Gemini-3.8-Live audio requires Gemini-3.8-Live for answers. Choose another speech provider or select Gemini-3.8-Live in AI Providers.');
       }
       const audioKeys = changed.filter(key => /^(SPEECH_|AZURE_|WHISPER_|CLOUDFLARE_|SYSTEM_AUDIO_|GEMINI_TRANSCRIBE_)/.test(key));
+      if (updates.DIALOGUE_LANGUAGES !== undefined &&
+          getDialogueLanguages(process.env).join(',') !== updates.DIALOGUE_LANGUAGES) audioKeys.push('DIALOGUE_LANGUAGES');
       if (changed.includes('LLM_PROVIDER') && [process.env.LLM_PROVIDER, updates.LLM_PROVIDER].includes('gemini-live')) audioKeys.push('LLM_PROVIDER');
       if (changed.includes('GEMINI_API_KEY') && ['gemini-live', 'gemini-live-audio'].includes(speechService.provider)) audioKeys.push('GEMINI_API_KEY');
       if (audioKeys.length && (speechService.isRecording || speechService.isProcessingAudio)) throw new Error('Stop audio capture and wait for transcription before changing speech settings.');
@@ -1746,7 +1759,7 @@ class ApplicationController {
       if (settings.appIcon) this.appIcon = settings.appIcon;
       if (settings.selectedIcon) { this.appIcon = settings.selectedIcon; this.updateAppIcon(settings.selectedIcon); }
       if (settings.windowGap !== undefined && Number.isFinite(Number(settings.windowGap))) windowManager.setWindowGap(Number(settings.windowGap));
-      if (changed.some(key => key !== 'GEMINI_TRANSCRIBE_LANGUAGES' && /^(LLM_|GEMINI_|OPENAI_|CLOUDFLARE_)/.test(key))) llmService.initializeClient();
+      if (changed.some(key => !key.startsWith('GEMINI_TRANSCRIBE_') && /^(LLM_|GEMINI_|OPENAI_|CLOUDFLARE_)/.test(key))) llmService.initializeClient();
       if (audioKeys.length) {
         speechService.initializeClient();
         this.speechAvailable = speechService.isAvailable();

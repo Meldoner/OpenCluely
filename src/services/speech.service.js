@@ -416,8 +416,6 @@ class SpeechService extends EventEmitter {
     this.segmentBytes = 0;
     this.segmentTimer = null;
     this.transcriptionInFlight = false;
-    this.pendingFlush = false;
-    this.pendingFinal = false;
     this.audioProgram = null;
     this.whisperCommand = null;
     this.whisperWorker = new WhisperWorkerService();
@@ -487,7 +485,7 @@ class SpeechService extends EventEmitter {
       this.speechConfig = sdk.SpeechConfig.fromSubscription(subscriptionKey, region);
 
       const azureConfig = config.get('speech.azure') || {};
-      this.speechConfig.speechRecognitionLanguage = azureConfig.language || 'en-US';
+      this.speechConfig.speechRecognitionLanguage = this._getDialogueLanguages()[0] || azureConfig.language || 'en-US';
       this.speechConfig.outputFormat = sdk.OutputFormat.Detailed;
       this.speechConfig.setProperty(sdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, '5000');
       this.speechConfig.setProperty(sdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, '2000');
@@ -504,7 +502,7 @@ class SpeechService extends EventEmitter {
       this.available = true;
       logger.info('Azure Speech service initialized successfully', {
         region,
-        language: azureConfig.language || 'en-US'
+        language: this.speechConfig.speechRecognitionLanguage
       });
       this.emit('status', 'Azure Speech Services ready');
     } catch (error) {
@@ -692,8 +690,6 @@ class SpeechService extends EventEmitter {
     this.segmentBuffers = [];
     this.segmentBytes = 0;
     this.transcriptionInFlight = false;
-    this.pendingFlush = false;
-    this.pendingFinal = false;
     this.manualStopRequested = false;
     this._resetVadState();
     this.emit('status', `${this.provider === 'cloudflare' ? 'Cloudflare' : 'Local'} Whisper system audio recording started`);
@@ -736,9 +732,11 @@ class SpeechService extends EventEmitter {
     try {
       live = audioAnswers
         ? liveAPI.createAudioConversation(this.getLiveAudioRequest(), { manual })
-        : liveAPI.createTranscription({ manual, languageCodes: this._getGeminiTranscribeLanguages() });
+        : liveAPI.createRecoveringTranscription({ manual, languageCodes: this._getGeminiTranscribeLanguages(), customVocabulary: this._getGeminiTranscribeVocabulary() });
     } catch (error) { this._abortGeminiLive(error); return; }
     this.liveSession = live;
+    live.on('retry', attempt => this.emit('status', `Live connection interrupted; reconnecting (${attempt}/2)…`));
+    live.on('reconnected', () => this.emit('status', 'Live connection restored'));
     if (audioAnswers) {
       live.on('transcription', text => {
         if (this.liveSession !== live) return;
@@ -783,10 +781,11 @@ class SpeechService extends EventEmitter {
 
   _abortGeminiLive(error) {
     if (this.liveSession && !this.liveSession.closed) { this.liveSession.fail(error); return; }
+    const wasRecording = this.isRecording;
     this.isRecording = false;
     this.isProcessingAudio = false;
     this._cleanup();
-    this.emit('recording-stopped');
+    if (wasRecording) this.emit('recording-stopped');
     this.emit('error', error.message);
     this.emit('status', 'Gemini Live recording stopped');
   }
@@ -799,7 +798,7 @@ class SpeechService extends EventEmitter {
     this.emit('status', 'Finishing Live transcription…');
     try {
       if (this.recording) { this.recording.stop(); this.recording = null; }
-      if (live?.ready) {
+      if (live?.ready || live?.recovering) {
         await live.finish({ hasSpeech: this.liveHadSpeech });
         if (!this.usesLiveAudioAnswers() && this.liveSession === live && this.isManualCaptureMode() && this.liveFinalTranscripts.length) {
           this.emit('transcription', this.liveFinalTranscripts.join(' '));
@@ -822,7 +821,7 @@ class SpeechService extends EventEmitter {
    * (which split sentences mid-word and transcribed silent windows), we
    * accumulate audio while the user is speaking and flush a segment once a
    * natural pause is detected. State is intentionally simple so it works for
-   * both the renderer (Web Audio) and native (sox/arecord) capture paths.
+   * both the renderer (Web Audio) and native system-loopback capture paths.
    */
   _resetVadState() {
     this.vadSpeaking = false;        // currently inside an utterance
@@ -869,18 +868,19 @@ class SpeechService extends EventEmitter {
       // flushing once the accumulated audio reaches the configured segment size.
       if (!this._isVadEnabled()) {
         if (this.segmentBytes && this.vadSpeechMs >= this._getWhisperSegmentMs()) {
-          this._endUtteranceFlush();
+          this._endUtteranceFlush({ forced: true });
         }
         return;
       }
 
-      // If we're mid-utterance and no audio has arrived recently, the mic may
+      // If we're mid-utterance and no audio has arrived recently, capture may
       // have stalled — flush what we captured rather than holding it forever.
       const sinceLastChunk = this.vadLastChunkAt ? Date.now() - this.vadLastChunkAt : 0;
       const stalled = this.vadSpeaking && sinceLastChunk > 1500;
-      const tooLong = this.vadSpeaking && this.vadSpeechMs >= this._getMaxUtteranceMs();
+      const tooLong = this.vadSpeaking && this.segmentBytes / 32 >= this._getMaxUtteranceMs();
       if (stalled || tooLong) {
-        this._endUtteranceFlush();
+        if (this.vadSpeechMs >= this._getMinUtteranceMs()) this._endUtteranceFlush({ forced: tooLong && !stalled });
+        else this._discardWhisperUtterance();
       }
     }, 500);
   }
@@ -924,7 +924,7 @@ class SpeechService extends EventEmitter {
    * buffering when VAD is disabled.
    */
   _ingestWhisperAudio(buffer) {
-    if (!buffer || !buffer.length) {
+    if (!buffer || !buffer.length || this.manualStopRequested) {
       return;
     }
 
@@ -949,9 +949,19 @@ class SpeechService extends EventEmitter {
       this.vadSpeaking = true;
       this.vadSpeechMs += this._chunkDurationMs(buffer);
       this.vadLastChunkAt = Date.now();
+      if (this.vadSpeechMs >= this._getWhisperSegmentMs()) this._endUtteranceFlush({ forced: true });
       return;
     }
 
+    // Analyse 20 ms frames even when Web Audio delivers a 256 ms block.
+    // Otherwise a short word is averaged with silence and never enters VAD.
+    for (let offset = 0; offset < buffer.length; offset += 640) {
+      this._ingestWhisperFrame(buffer.subarray(offset, offset + 640));
+      if (!this.isRecording) break;
+    }
+  }
+
+  _ingestWhisperFrame(buffer) {
     this.vadLastChunkAt = Date.now();
     const chunkMs = this._chunkDurationMs(buffer);
     const energy = this._chunkRmsEnergy(buffer);
@@ -963,13 +973,15 @@ class SpeechService extends EventEmitter {
     // talking immediately), clamp to the configured floor so a high seed can't
     // push the enter-threshold out of reach and stall VAD for the whole session.
     if (!this.vadNoiseInit) {
-      this.vadNoiseFloor = Math.min(energy, floor);
+      this.vadNoiseFloor = Math.min(energy, floor / 3);
       this.vadNoiseInit = true;
     }
     // Hysteresis: it takes more energy to *start* an utterance than to keep
     // one going, so a brief dip mid-sentence doesn't end it prematurely.
-    const enterThreshold = Math.max(floor, this.vadNoiseFloor * 2.5);
-    const exitThreshold = Math.max(floor * 0.7, this.vadNoiseFloor * 1.6);
+    // Do not let a near-threshold background ratchet sensitivity upwards
+    // until a quiet word is permanently classified as more background.
+    const enterThreshold = Math.max(floor, Math.min(floor * 1.5, this.vadNoiseFloor * 2.5));
+    const exitThreshold = Math.max(floor * 0.7, Math.min(enterThreshold * 0.9, this.vadNoiseFloor * 1.6));
     const isVoiced = this.vadSpeaking ? energy >= exitThreshold : energy >= enterThreshold;
 
     if (!this.vadSpeaking) {
@@ -1014,23 +1026,32 @@ class SpeechService extends EventEmitter {
 
     const pausedLongEnough = this.vadSilenceMs >= this._getSilenceHangoverMs();
     const haveRealSpeech = this.vadSpeechMs >= this._getMinUtteranceMs();
-    const tooLong = this.vadSpeechMs >= this._getMaxUtteranceMs();
+    const tooLong = this.segmentBytes / 32 >= this._getMaxUtteranceMs();
 
     if ((pausedLongEnough && haveRealSpeech) || tooLong) {
-      this._endUtteranceFlush();
+      this._endUtteranceFlush({ forced: tooLong && !pausedLongEnough });
     } else if (pausedLongEnough && !haveRealSpeech) {
       // Just noise (cough/click) with no real speech — discard, don't waste a
       // Whisper spawn or risk a hallucinated transcript.
-      this.segmentBuffers = [];
-      this.segmentBytes = 0;
-      this.vadSpeaking = false;
-      this.vadSpeechMs = 0;
-      this.vadSilenceMs = 0;
+      this._discardWhisperUtterance();
     }
   }
 
+  _discardWhisperUtterance() {
+    this.segmentBuffers = [];
+    this.segmentBytes = 0;
+    this.vadSpeaking = false;
+    this.vadSpeechMs = 0;
+    this.vadSilenceMs = 0;
+    this.vadPreRoll = [];
+    this.vadPreRollMs = 0;
+    this.segmentHasOverlap = false;
+  }
+
   /** Flush the accumulated utterance and reset VAD for the next one. */
-  _endUtteranceFlush() {
+  _endUtteranceFlush({ forced = false } = {}) {
+    const overlap = forced && this.segmentBytes
+      ? Buffer.concat(this.segmentBuffers, this.segmentBytes).subarray(-400 * 32) : null;
     this.vadSpeaking = false;
     this.vadSpeechMs = 0;
     this.vadSilenceMs = 0;
@@ -1038,9 +1059,14 @@ class SpeechService extends EventEmitter {
     this.vadPreRollMs = 0;
     this._flushWhisperSegment({ final: false }).catch((error) => {
       logger.error('Whisper segment transcription failed', { error: error.message });
-      this.emit('error', `Transcription failed: ${error.message}`);
-      this.stopRecording();
     });
+    if (overlap && this.isRecording) {
+      this.segmentBuffers = [overlap];
+      this.segmentBytes = overlap.length;
+      this.segmentHasOverlap = true;
+      this.vadSpeaking = true;
+      if (!this._isVadEnabled()) this.vadSpeechMs = overlap.length / 32;
+    }
   }
 
   _chunkDurationMs(buffer) {
@@ -1097,6 +1123,7 @@ class SpeechService extends EventEmitter {
   }
 
   async _finalizeWhisperStop({ captureAlreadyStopped = false } = {}) {
+    const generation = this.transcriptionGeneration;
     if (this.segmentTimer) {
       clearInterval(this.segmentTimer);
       this.segmentTimer = null;
@@ -1112,11 +1139,16 @@ class SpeechService extends EventEmitter {
     }
 
     try {
+      if (this.segmentHasOverlap && this.segmentBytes <= 400 * 32) this._discardWhisperUtterance();
+      if (!this._isManualCaptureMode() && this._isVadEnabled() && this.vadSpeechMs < this._getMinUtteranceMs()) {
+        this._discardWhisperUtterance();
+      }
       await this._flushWhisperSegment({ final: true });
     } catch (error) {
       logger.error('Final Whisper transcription failed', { error: error.message });
-      this.emit('error', `Whisper transcription failed: ${error.message}`);
     } finally {
+      // A failed/cancelled task must never clean up a new recording session.
+      if (generation !== this.transcriptionGeneration) return;
       this._cleanup();
       this.isProcessingAudio = false;
       this.whisperWorker.releaseWhenIdle();
@@ -1136,6 +1168,11 @@ class SpeechService extends EventEmitter {
   }
 
   _cleanup() {
+    this.transcriptionGeneration = (this.transcriptionGeneration || 0) + 1;
+    if (this.transcriptionAbortController) {
+      this.transcriptionAbortController.abort(Object.assign(new Error('Transcription cancelled'), { code: 'ABORT_ERR' }));
+      this.transcriptionAbortController = null;
+    }
     if (this.liveLimitTimer) { clearTimeout(this.liveLimitTimer); this.liveLimitTimer = null; }
     if (this.liveSession) {
       const live = this.liveSession;
@@ -1190,8 +1227,11 @@ class SpeechService extends EventEmitter {
     this.segmentBuffers = [];
     this.segmentBytes = 0;
     this.transcriptionInFlight = false;
-    this.pendingFlush = false;
-    this.pendingFinal = false;
+    this.transcriptionQueue = [];
+    this.queuedAudioBytes = 0;
+    this.transcriptionTask = null;
+    this.segmentHasOverlap = false;
+    this.previousWhisperTranscript = '';
     this._resetVadState();
     this._audioDataLogged = false;
     this.useRendererCapture = false;
@@ -1360,13 +1400,30 @@ class SpeechService extends EventEmitter {
   }
 
   _getGeminiTranscribeLanguages() {
+    if (this._hasDialogueLanguages()) return this._getDialogueLanguages();
     return require('../core/gemini-transcribe-languages').parse(this._getSetting('geminiTranscribeLanguages') ?? process.env.GEMINI_TRANSCRIBE_LANGUAGES ?? '');
+  }
+
+  _hasDialogueLanguages() {
+    return this._getSetting('dialogueLanguages') !== undefined || process.env.DIALOGUE_LANGUAGES !== undefined;
+  }
+
+  _getDialogueLanguages() {
+    const runtime = this._getSetting('dialogueLanguages');
+    const env = runtime === undefined ? process.env : { ...process.env, DIALOGUE_LANGUAGES: runtime };
+    return require('../core/dialogue-languages').getDialogueLanguages(env);
   }
 
   cancelLiveRecording() {
     if (!this.liveSession) return;
     // Report cancellation while listeners still own the active response ID.
     this.liveSession.close();
+  }
+
+  _getGeminiTranscribeVocabulary() {
+    return require('../core/transcription-vocabulary').parseVocabulary(
+      this._getSetting('geminiTranscribeVocabulary') ?? process.env.GEMINI_TRANSCRIBE_VOCABULARY ?? require('../core/ai-settings').DEFAULTS.geminiTranscribeVocabulary
+    );
   }
 
   shutdown() {
@@ -1377,7 +1434,7 @@ class SpeechService extends EventEmitter {
   }
 
   updateSettings(settings = {}) {
-    const speechKeys = ['speechProvider', 'geminiTranscribeLanguages', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs'];
+    const speechKeys = ['speechProvider', 'dialogueLanguages', 'geminiTranscribeLanguages', 'geminiTranscribeVocabulary', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs'];
     let changed = false;
 
     for (const key of speechKeys) {
@@ -1441,6 +1498,7 @@ class SpeechService extends EventEmitter {
   }
 
   _getWhisperLanguage() {
+    if (this._hasDialogueLanguages()) return require('../core/dialogue-languages').getWhisperLanguage(this._getDialogueLanguages());
     return this._getSetting('whisperLanguage') || process.env.WHISPER_LANGUAGE || config.get('speech.whisper.language') || 'auto';
   }
 
@@ -1471,7 +1529,7 @@ class SpeechService extends EventEmitter {
   }
 
   _getMinUtteranceMs() {
-    return this._vadNumber('whisperMinUtteranceMs', 'WHISPER_MIN_UTTERANCE_MS', 'speech.whisper.minUtteranceMs', 350, 100);
+    return this._vadNumber('whisperMinUtteranceMs', 'WHISPER_MIN_UTTERANCE_MS', 'speech.whisper.minUtteranceMs', 80, 40);
   }
 
   _getMaxUtteranceMs() {
@@ -1483,7 +1541,7 @@ class SpeechService extends EventEmitter {
   }
 
   _getVadEnergyFloor() {
-    return this._vadNumber('whisperVadEnergyFloor', 'WHISPER_VAD_ENERGY_FLOOR', 'speech.whisper.vadEnergyFloor', 0.008, 0.0005);
+    return this._vadNumber('whisperVadEnergyFloor', 'WHISPER_VAD_ENERGY_FLOOR', 'speech.whisper.vadEnergyFloor', 0.0015, 0.0005);
   }
 
   _getSetting(key) {
@@ -1859,32 +1917,102 @@ class SpeechService extends EventEmitter {
     }
   }
 
-  async _flushWhisperSegment({ final }) {
-    if (this.transcriptionInFlight) {
-      this.pendingFlush = true;
-      this.pendingFinal = this.pendingFinal || final;
-      return this.transcriptionTask;
+  _flushWhisperSegment() {
+    if (this.segmentBytes) {
+      const audioBuffer = Buffer.concat(this.segmentBuffers, this.segmentBytes);
+      this.segmentBuffers = [];
+      this.segmentBytes = 0;
+      this.transcriptionQueue.push({ audioBuffer, hasOverlap: !!this.segmentHasOverlap });
+      this.segmentHasOverlap = false;
+      this.queuedAudioBytes += audioBuffer.length;
     }
-    if (!this.segmentBytes) return;
-    const audioBuffer = Buffer.concat(this.segmentBuffers, this.segmentBytes);
-    this.segmentBuffers = [];
-    this.segmentBytes = 0;
-    this.transcriptionInFlight = true;
-    this.transcriptionTask = (async () => {
-      try {
-        const transcript = await this._transcribeWhisperBuffer(audioBuffer);
+    if (!this.transcriptionInFlight && this.transcriptionQueue.length) {
+      const generation = this.transcriptionGeneration;
+      this.transcriptionInFlight = true;
+      this.transcriptionTask = this._drainWhisperQueue(generation).catch(error => {
+        if (generation === this.transcriptionGeneration) {
+          const wasRecording = this.isRecording;
+          this.isRecording = false;
+          this.isProcessingAudio = false;
+          this._cleanup();
+          this.whisperWorker.releaseWhenIdle();
+          if (wasRecording) this.emit('recording-stopped');
+          this.emit('error', `Transcription failed: ${error.message}. Recording stopped; unprocessed speech was discarded. Start recording again to continue.`);
+          this.emit('status', 'Transcription failed; recording stopped');
+        }
+        throw error;
+      });
+    }
+    const task = this.transcriptionTask || Promise.resolve();
+    // Keep complete utterances in order. Stop capture at one minute of backlog
+    // and drain it, rather than merging unlimited audio into one huge request.
+    if (this.isRecording && this.queuedAudioBytes >= this._getMaxQueuedAudioBytes()) {
+      this.stopRecording();
+      this.emit('status', 'Transcription is slower than recording. Capture stopped; processing queued speech.');
+    }
+    return task;
+  }
+
+  _getMaxQueuedAudioBytes() {
+    return 60000 * 32; // 60 seconds of 16 kHz mono PCM16, excluding the active request.
+  }
+
+  _getTranscriptionTimeoutMs() {
+    return this.provider === 'cloudflare' ? 120000 : 180000;
+  }
+
+  async _drainWhisperQueue(generation) {
+    try {
+      while (generation === this.transcriptionGeneration && this.transcriptionQueue.length) {
+        const { audioBuffer, hasOverlap } = this.transcriptionQueue.shift();
+        this.queuedAudioBytes -= audioBuffer.length;
+        const transcript = await this._transcribeWhisperSegment(audioBuffer);
+        if (generation !== this.transcriptionGeneration) return;
         const clean = transcript ? transcript.trim() : '';
-        if (clean && !this._isHallucinatedTranscript(clean)) this.emit('transcription', clean);
-      } finally {
-        this.transcriptionInFlight = false;
-        if (this.pendingFlush) {
-          const runFinal = this.pendingFinal;
-          this.pendingFlush = this.pendingFinal = false;
-          await this._flushWhisperSegment({ final: runFinal });
+        if (clean && !this._isHallucinatedTranscript(clean)) {
+          const text = hasOverlap
+            ? require('../core/transcript-overlap').removeTranscriptOverlap(this.previousWhisperTranscript, clean) : clean;
+          this.previousWhisperTranscript = clean;
+          if (text) this.emit('transcription', text);
         }
       }
-    })();
-    return this.transcriptionTask;
+    } finally {
+      if (generation === this.transcriptionGeneration) this.transcriptionInFlight = false;
+    }
+  }
+
+  async _transcribeWhisperSegment(audioBuffer) {
+    const controller = new AbortController();
+    this.transcriptionAbortController = controller;
+    let deadline;
+    let onAbort;
+    try {
+      const cancelled = new Promise((resolve, reject) => {
+        onAbort = () => reject(controller.signal.reason);
+        controller.signal.addEventListener('abort', onAbort, { once: true });
+        deadline = setTimeout(() => controller.abort(Object.assign(
+          new Error('Speech transcription timed out'), { code: 'TRANSCRIPTION_TIMEOUT' }
+        )), this._getTranscriptionTimeoutMs());
+      });
+      return await Promise.race([
+        cancelled,
+        (async () => {
+          const { isRetryableSpeechError, waitForSpeechRetry } = require('../core/speech-retry');
+          for (let attempt = 1; ; attempt++) {
+            try { return await this._transcribeWhisperBuffer(audioBuffer, { signal: controller.signal }); }
+            catch (error) {
+              if (controller.signal.aborted || attempt >= 3 || !isRetryableSpeechError(error)) throw error;
+              this.emit('status', `Temporary speech service error; retrying (${attempt}/2)…`);
+              await waitForSpeechRetry(attempt, controller.signal);
+            }
+          }
+        })()
+      ]);
+    } finally {
+      clearTimeout(deadline);
+      controller.signal.removeEventListener('abort', onAbort);
+      if (this.transcriptionAbortController === controller) this.transcriptionAbortController = null;
+    }
   }
 
   /**
@@ -1899,40 +2027,45 @@ class SpeechService extends EventEmitter {
       return true;
     }
     const HALLUCINATIONS = new Set([
-      'thank you',
       'thank you for watching',
       'thanks for watching',
       'thank you so much for watching',
       'please subscribe',
       'like and subscribe',
-      'you',
-      'bye',
-      'bye bye',
-      'okay',
-      'ok',
-      'so',
-      'the end',
       'subtitles by the amara org community'
     ]);
     return HALLUCINATIONS.has(normalized);
   }
 
-  async _transcribeWhisperBuffer(audioBuffer) {
+  _normalizeWhisperAudio(audioBuffer) {
+    let peak = 0;
+    for (let i = 0; i < audioBuffer.length; i += 2) peak = Math.max(peak, Math.abs(audioBuffer.readInt16LE(i)));
+    // Modest gain for quiet speech; leave silence and normal/loud audio alone.
+    const gain = peak ? Math.min(8, 6553 / peak) : 1;
+    if (gain <= 1) return audioBuffer;
+    const normalized = Buffer.alloc(audioBuffer.length);
+    for (let i = 0; i < audioBuffer.length; i += 2) normalized.writeInt16LE(Math.round(audioBuffer.readInt16LE(i) * gain), i);
+    return normalized;
+  }
+
+  async _transcribeWhisperBuffer(audioBuffer, { signal } = {}) {
+    audioBuffer = this._normalizeWhisperAudio(audioBuffer);
     if (this.provider === 'cloudflare') {
-      return cloudflareSpeech.transcribe(this._createWavBuffer(audioBuffer), this._getWhisperLanguage());
+      return cloudflareSpeech.transcribe(this._createWavBuffer(audioBuffer), this._getWhisperLanguage(), undefined, { signal });
     }
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-'));
     const audioFilePath = path.join(tempDir, 'segment.wav');
 
     try {
       fs.writeFileSync(audioFilePath, this._createWavBuffer(audioBuffer));
-      return await this._transcribeWhisperFile(audioFilePath);
+      return await this._transcribeWhisperFile(audioFilePath, { signal });
     } finally {
       this._removeTempDir(tempDir);
     }
   }
 
-  async _transcribeWhisperFile(audioFilePath) {
+  async _transcribeWhisperFile(audioFilePath, { signal } = {}) {
+    if (signal?.aborted) throw signal.reason;
     if (!this.whisperCommand) {
       throw new Error('Local Whisper CLI not configured');
     }
@@ -1944,7 +2077,7 @@ class SpeechService extends EventEmitter {
           model: this._getWhisperModel(),
           language: this._getWhisperLanguage(),
           modelDir: this._getWhisperModelDir(),
-          device: this._getWhisperDevice()
+          device: this._getWhisperDevice(), signal
         });
         logger.info('Persistent Whisper transcription completed', {
           processingTime: Date.now() - startedAt,
@@ -1955,7 +2088,8 @@ class SpeechService extends EventEmitter {
         });
         return result.text || '';
       } catch (error) {
-        if (String(error.code || '').startsWith('CUDA_')) throw error;
+        if (signal?.aborted || /^(CUDA_|WHISPER_TIMEOUT|TRANSCRIPTION_TIMEOUT|ABORT_ERR)/.test(String(error.code || ''))) throw error;
+        this.whisperWorker.close();
         logger.warn('Persistent Whisper worker failed; falling back to CLI', {
           error: error.message,
           workerTraceback: error.workerTraceback
@@ -1998,23 +2132,41 @@ class SpeechService extends EventEmitter {
           env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
         });
 
+        let settled = false;
+        const finish = (error, terminate = false) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(deadline);
+          signal?.removeEventListener('abort', onAbort);
+          if (terminate) {
+            try { child.kill(); }
+            catch (killError) { logger.warn('Could not stop Whisper CLI', { error: killError.message }); }
+          }
+          if (error) reject(error); else resolve();
+        };
+        const onAbort = () => finish(signal.reason, true);
+        const deadline = setTimeout(() => finish(Object.assign(
+          new Error('Whisper CLI transcription timed out'), { code: 'WHISPER_TIMEOUT' }
+        ), true), this._getTranscriptionTimeoutMs());
+        signal?.addEventListener('abort', onAbort, { once: true });
         let stderr = '';
         child.stderr.on('data', (chunk) => {
-          stderr += chunk.toString();
+          stderr = (stderr + chunk.toString()).slice(-8192);
         });
 
         child.on('error', (error) => {
-          reject(error);
+          finish(error);
         });
 
         child.on('close', (code) => {
           if (code === 0) {
-            resolve();
+            finish();
             return;
           }
 
-          reject(new Error(stderr.trim() || `Whisper exited with code ${code}`));
+          finish(new Error(stderr.trim() || `Whisper exited with code ${code}`));
         });
+        if (signal?.aborted) onAbort();
       });
 
       const transcriptPath = path.join(outputDir, `${path.parse(audioFilePath).name}.txt`);

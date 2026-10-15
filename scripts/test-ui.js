@@ -13,17 +13,22 @@ app.setPath('userData', temporary);
 const settings = { llmProvider: 'openai', openaiKey: 'test-key', openaiModel: DEFAULTS.openaiModel,
   openaiBaseUrl: DEFAULTS.openaiBaseUrl, speechProvider: 'cloudflare',
   cloudflareAccountId: 'a'.repeat(32), cloudflareToken: 'test-token', cloudflareModel: DEFAULTS.cloudflareModel,
-  cloudflareWhisperModel: DEFAULTS.cloudflareWhisperModel, geminiTranscribeLanguages: [], codingLanguage: 'go', activeSkill: 'backend',
+  cloudflareWhisperModel: DEFAULTS.cloudflareWhisperModel, geminiTranscribeLanguages: [], dialogueLanguages: [], codingLanguage: 'go', activeSkill: 'backend',
   whisperCaptureMode: 'vad', whisperDevice: 'auto', whisperResponseTarget: 'both', whisperSegmentMs: '4000' };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const captureErrors = [];
+let quitRequests = 0;
+ipcMain.on('quit-app', () => { quitRequests++; });
 ipcMain.handle('get-settings', () => settings);
 ipcMain.handle('save-settings', (_event, data) => { Object.assign(settings, data); return { success: true }; });
 ipcMain.on('save-settings', (_event, data) => Object.assign(settings, data));
 ipcMain.handle('get-available-skills', () => catalogue);
 ipcMain.handle('get-window-stats', () => ({ isInteractive: true }));
 ipcMain.handle('get-speech-availability', () => true);
-ipcMain.handle('resize-window', () => true);
+ipcMain.handle('resize-window', (event, { width, height }) => {
+  BrowserWindow.fromWebContents(event.sender).setContentSize(Math.min(1200, Math.ceil(width)), Math.ceil(height));
+  return true;
+});
 ipcMain.handle('resize-llm-window-for-content', () => true);
 ipcMain.handle('update-active-skill', (_event, skill) => { settings.activeSkill = skill; return { success: true }; });
 ipcMain.handle('test-llm-connection', () => ({ success: true, model: 'mock-model' }));
@@ -49,38 +54,55 @@ async function load(file, size) {
 
 app.whenReady().then(async () => {
   try {
-    const settingsUI = await load('settings.html', [760, 820]);
+    const settingsUI = await load('settings.html', [400, 380]);
+    assert.equal(await settingsUI.execute(`document.querySelector('.settings-content').scrollWidth <= document.querySelector('.settings-content').clientWidth`), true);
     assert.equal(await settingsUI.execute(`document.getElementById('ai-openaiKey').value`), 'test-key');
     assert.equal(await settingsUI.execute(`document.getElementById('activeSkill').options.length`), 6);
     assert.equal(await settingsUI.execute(`document.getElementById('codingLanguage').value`), 'go');
     assert.equal(await settingsUI.execute(`document.getElementById('cloudflareSpeechFields').hidden`), false);
+    assert.deepEqual(await settingsUI.execute(`Array.from(document.querySelectorAll('.settings-section-title')).slice(0, 4).map(node => node.textContent.trim())`), ['Main Settings', 'Language & Skills', 'Answer Model', 'Transcription Model']);
+    assert.equal(await settingsUI.execute(`document.getElementById('answerAdvanced').open || document.getElementById('speechAdvanced').open`), false);
+    assert.equal(await settingsUI.execute(`document.getElementById('ai-openaiKey').checkVisibility()`), false);
+    assert.equal(await settingsUI.execute(`document.getElementById('ai-openaiModel').checkVisibility()`), true);
+    assert.equal(await settingsUI.execute(`document.getElementById('cloudflareWhisperModel').checkVisibility()`), true);
+    await settingsUI.execute(`document.querySelector('#answerAdvanced summary').click(); document.querySelector('#speechAdvanced summary').click();`);
+    assert.equal(await settingsUI.execute(`document.getElementById('ai-openaiKey').checkVisibility()`), true);
+    assert.equal(await settingsUI.execute(`document.getElementById('speech-cloudflareToken').checkVisibility()`), true);
+    await settingsUI.execute(`document.getElementById('speech-cloudflareToken').value = 'updated-test-token'; document.getElementById('speech-cloudflareToken').dispatchEvent(new Event('change'));`);
+    await delay(100);
+    assert.equal(settings.cloudflareToken, 'updated-test-token');
+    assert.equal(await settingsUI.execute(`document.getElementById('ai-cloudflareToken').value`), 'updated-test-token');
+    await settingsUI.execute(`document.getElementById('speech-cloudflareToken').value = 'test-token'; document.getElementById('speech-cloudflareToken').dispatchEvent(new Event('change')); document.querySelector('#answerAdvanced summary').click(); document.querySelector('#speechAdvanced summary').click();`);
     await settingsUI.execute(`document.getElementById('ai-openaiModel').value = 'custom-model'; document.getElementById('ai-openaiModel').dispatchEvent(new Event('change'));`);
     await delay(100);
     assert.equal(settings.openaiModel, 'custom-model');
-    await settingsUI.execute(`document.getElementById('cloudflareWhisperModel').value = '@cf/openai/whisper-large-v3-turbo'; document.getElementById('cloudflareWhisperModel').dispatchEvent(new Event('change')); document.getElementById('whisperLanguage').value = 'ru'; document.getElementById('whisperLanguage').dispatchEvent(new Event('change'));`);
+    await settingsUI.execute(`document.getElementById('cloudflareWhisperModel').value = '@cf/openai/whisper-large-v3-turbo'; document.getElementById('cloudflareWhisperModel').dispatchEvent(new Event('change')); document.querySelector('#dialogueLanguageFields input[value="ru-RU"]').click();`);
     await delay(100);
     assert.equal(settings.cloudflareWhisperModel, '@cf/openai/whisper-large-v3-turbo');
-    assert.equal(settings.whisperLanguage, 'ru');
-    assert.equal(await settingsUI.execute(`document.getElementById('whisperLanguage').disabled`), false);
+    assert.deepEqual(settings.dialogueLanguages, ['ru-RU']);
+    assert.equal(await settingsUI.execute(`document.getElementById('dialogueLanguageFields').closest('.settings-section').querySelector('#codingLanguage') !== null`), true);
     assert.deepEqual(settingsUI.errors, []);
 
     await settingsUI.execute(`document.querySelector('#aiProviderSettings select').value = 'gemini-live'; document.querySelector('#aiProviderSettings select').dispatchEvent(new Event('change')); document.getElementById('ai-geminiKey').value = 'test-gemini-key'; document.getElementById('ai-geminiKey').dispatchEvent(new Event('change')); document.getElementById('speechProvider').value = 'gemini-live'; document.getElementById('speechProvider').dispatchEvent(new Event('change'));`);
     await delay(100);
     assert.equal(settings.llmProvider, 'gemini-live');
     assert.equal(settings.speechProvider, 'gemini-live');
+    assert.equal(await settingsUI.execute(`document.getElementById('geminiVocabularyFields').hidden`), false);
+    await settingsUI.execute(`document.getElementById('geminiTranscribeVocabulary').value = 'KVCache, PyTorch'; document.getElementById('geminiTranscribeVocabulary').dispatchEvent(new Event('change'));`);
+    await delay(100);
+    assert.equal(settings.geminiTranscribeVocabulary, 'KVCache, PyTorch');
     assert.equal(await settingsUI.execute(`document.getElementById('speechProvider').disabled`), false);
     assert.match(await settingsUI.execute(`document.getElementById('speechProvider').selectedOptions[0].textContent`), /Gemini-3.5-Transcribe Live/);
-    assert.equal(await settingsUI.execute(`document.getElementById('geminiTranscribeLanguageFields').hidden`), false);
+    assert.equal(await settingsUI.execute(`document.getElementById('dialogueLanguageFields').hidden`), false);
     assert.equal(settings.geminiKey, 'test-gemini-key');
     assert.equal(await settingsUI.execute(`document.getElementById('ai-geminiKey').parentElement.hidden`), false);
     assert.equal(await settingsUI.execute(`document.getElementById('geminiLiveSpeechFields').hidden`), false);
     assert.equal(await settingsUI.execute(`document.getElementById('whisperCaptureMode').disabled`), false);
-    assert.equal(await settingsUI.execute(`document.getElementById('whisperLanguage').closest('.settings-item').hidden`), true);
     await settingsUI.execute(`document.getElementById('speechProvider').value = 'gemini-live-audio'; document.getElementById('speechProvider').dispatchEvent(new Event('change'));`);
     await delay(100);
     assert.equal(settings.speechProvider, 'gemini-live-audio');
     assert.equal(settings.llmProvider, 'gemini-live');
-    assert.equal(await settingsUI.execute(`document.getElementById('geminiTranscribeLanguageFields').hidden`), true);
+    assert.equal(await settingsUI.execute(`document.getElementById('dialogueLanguageFields').hidden`), false);
     for (const provider of ['whisper', 'azure', 'cloudflare']) {
       await settingsUI.execute(`document.getElementById('speechProvider').value = '${provider}'; document.getElementById('speechProvider').dispatchEvent(new Event('change'));`);
       await delay(100);
@@ -88,14 +110,13 @@ app.whenReady().then(async () => {
       assert.equal(settings.llmProvider, 'gemini-live');
     }
     assert.equal(await settingsUI.execute(`document.getElementById('cloudflareSpeechFields').hidden`), false);
-    assert.equal(await settingsUI.execute(`document.getElementById('ai-cloudflareToken').parentElement.hidden`), false);
+    assert.equal(await settingsUI.execute(`document.getElementById('speech-cloudflareToken').parentElement.hidden`), false);
     await settingsUI.execute(`document.getElementById('speechProvider').value = 'gemini-live-audio'; document.getElementById('speechProvider').dispatchEvent(new Event('change')); document.querySelector('#aiProviderSettings select').value = 'openai'; document.querySelector('#aiProviderSettings select').dispatchEvent(new Event('change'));`);
     await delay(100);
     assert.equal(settings.speechProvider, 'gemini-live');
     // Restore the original onboarding scenario after testing Live selection.
     await settingsUI.execute(`document.querySelector('#aiProviderSettings select').value = 'openai'; document.querySelector('#aiProviderSettings select').dispatchEvent(new Event('change')); document.getElementById('speechProvider').value = 'cloudflare'; document.getElementById('speechProvider').dispatchEvent(new Event('change'));`);
     await delay(100);
-    assert.equal(await settingsUI.execute(`document.getElementById('whisperLanguage').closest('.settings-item').hidden`), false);
     assert.equal(await settingsUI.execute(`document.getElementById('speechProvider').disabled`), false);
     assert.deepEqual(settingsUI.errors, []);
 
@@ -118,23 +139,24 @@ app.whenReady().then(async () => {
 
     await settingsUI.execute(`document.getElementById('speechProvider').value = 'gemini-live'; document.getElementById('speechProvider').dispatchEvent(new Event('change'));`);
     await delay(100);
-    assert.equal(await settingsUI.execute(`document.getElementById('geminiTranscribeLanguageFields').hidden`), false);
-    await settingsUI.execute(`document.querySelector('#geminiTranscribeLanguageFields input[value="ru-RU"]').click(); document.querySelector('#geminiTranscribeLanguageFields input[value="en-US"]').click();`);
+    assert.equal(await settingsUI.execute(`document.getElementById('dialogueLanguageFields').hidden`), false);
+    await settingsUI.execute(`document.querySelector('#dialogueLanguageFields summary').click(); document.querySelector('#dialogueLanguageFields button').click(); document.querySelector('#dialogueLanguageFields input[value="ru-RU"]').click(); document.querySelector('#dialogueLanguageFields input[value="en-US"]').click();`);
     await delay(100);
-    assert.deepEqual([...settings.geminiTranscribeLanguages].sort(), ['en-US', 'ru-RU']);
+    assert.deepEqual([...settings.dialogueLanguages].sort(), ['en-US', 'ru-RU']);
+    assert.equal(settings.dialogueLanguages[0], 'ru-RU');
     settingsUI.window.webContents.send('load-settings', settings);
     await delay(100);
-    assert.equal(await settingsUI.execute(`document.querySelector('#geminiTranscribeLanguageFields input[value="ru-RU"]').checked`), true);
-    assert.equal(await settingsUI.execute(`document.querySelector('#geminiTranscribeLanguageFields input[value="en-US"]').checked`), true);
-    await settingsUI.execute(`document.querySelector('#geminiTranscribeLanguageFields input[type="search"]').value = 'Russian'; document.querySelector('#geminiTranscribeLanguageFields input[type="search"]').dispatchEvent(new Event('input'));`);
-    assert.equal(await settingsUI.execute(`getComputedStyle(document.querySelector('#geminiTranscribeLanguageFields input[value="ru-RU"]').parentElement).display`), 'flex');
-    assert.equal(await settingsUI.execute(`getComputedStyle(document.querySelector('#geminiTranscribeLanguageFields input[value="en-US"]').parentElement).display`), 'none');
-    await settingsUI.execute(`document.querySelector('#geminiTranscribeLanguageFields button').click();`);
+    assert.equal(await settingsUI.execute(`document.querySelector('#dialogueLanguageFields input[value="ru-RU"]').checked`), true);
+    assert.equal(await settingsUI.execute(`document.querySelector('#dialogueLanguageFields input[value="en-US"]').checked`), true);
+    await settingsUI.execute(`document.querySelector('#dialogueLanguageFields input[type="search"]').value = 'Russian'; document.querySelector('#dialogueLanguageFields input[type="search"]').dispatchEvent(new Event('input'));`);
+    assert.equal(await settingsUI.execute(`getComputedStyle(document.querySelector('#dialogueLanguageFields input[value="ru-RU"]').parentElement).display`), 'flex');
+    assert.equal(await settingsUI.execute(`getComputedStyle(document.querySelector('#dialogueLanguageFields input[value="en-US"]').parentElement).display`), 'none');
+    await settingsUI.execute(`document.querySelector('#dialogueLanguageFields button').click();`);
     await delay(100);
-    assert.deepEqual(settings.geminiTranscribeLanguages, []);
-    await settingsUI.execute(`document.querySelector('#geminiTranscribeLanguageFields input[value="ru-RU"]').click(); document.querySelector('#geminiTranscribeLanguageFields input[value="en-US"]').click(); document.getElementById('speechProvider').value = 'cloudflare'; document.getElementById('speechProvider').dispatchEvent(new Event('change'));`);
+    assert.deepEqual(settings.dialogueLanguages, []);
+    await settingsUI.execute(`document.querySelector('#dialogueLanguageFields input[value="ru-RU"]').click(); document.querySelector('#dialogueLanguageFields input[value="en-US"]').click(); document.getElementById('speechProvider').value = 'cloudflare'; document.getElementById('speechProvider').dispatchEvent(new Event('change'));`);
     await delay(100);
-    assert.equal(await settingsUI.execute(`document.getElementById('geminiTranscribeLanguageFields').hidden`), true);
+    assert.equal(await settingsUI.execute(`document.getElementById('dialogueLanguageFields').hidden`), false);
     assert.deepEqual(settingsUI.errors, []);
 
     const onboarding = await load('onboarding.html', [960, 820]);
@@ -164,7 +186,7 @@ app.whenReady().then(async () => {
     await liveOnboarding.execute(`document.getElementById('nextBtn').click();`);
     await delay(100);
     assert.equal(settings.speechProvider, 'gemini-live');
-    assert.deepEqual([...settings.geminiTranscribeLanguages].sort(), ['en-US', 'fr-FR', 'ru-RU']);
+    assert.deepEqual([...settings.dialogueLanguages].sort(), ['en-US', 'fr-FR', 'ru-RU']);
     assert.equal(await liveOnboarding.execute(`document.querySelector('.screen.active').dataset.screen`), 'finish');
     assert.deepEqual(liveOnboarding.errors, []);
 
@@ -199,6 +221,18 @@ app.whenReady().then(async () => {
     assert.deepEqual(independentOnboarding.errors, []);
 
     const chat = await load('chat.html', [800, 820]);
+    chat.window.webContents.send('recording-started');
+    await delay(50);
+    assert.equal(await chat.execute(`document.getElementById('micButton').classList.contains('recording')`), true);
+    chat.window.webContents.send('recording-stopped');
+    chat.window.webContents.send('speech-status', { status: 'Recording stopped', available: true });
+    await delay(50);
+    assert.equal(await chat.execute(`document.getElementById('micButton').classList.contains('recording')`), false);
+    chat.window.webContents.send('speech-error', { error: 'Speech transcription timed out <test>', available: true });
+    await delay(50);
+    assert.match(await chat.execute(`document.querySelector('.message.error').textContent`), /Speech transcription timed out <test>/);
+    assert.equal(await chat.execute(`document.querySelector('.message.error test') !== null`), false);
+    await chat.execute(`document.querySelector('.message.error').remove();`);
     await chat.execute(`document.getElementById('messageInput').value = 'Test request'; document.getElementById('sendButton').click();`);
     await delay(450);
     assert.equal(await chat.execute(`Boolean(document.getElementById('thinking-indicator'))`), false);
@@ -323,18 +357,31 @@ app.whenReady().then(async () => {
     send(chat, 'session-cleared');
     assert.deepEqual(chat.errors, []);
 
-    const overlay = await load('index.html', [720, 200]);
+    const overlay = await load('index.html', [520, 35]);
     assert.equal(await overlay.execute(`window.mainWindowUI.currentSkill`), 'backend');
     assert.equal(await overlay.execute(`document.getElementById('activeSkill').value`), 'backend');
     assert.equal(await overlay.execute(`document.getElementById('codingLanguage').value`), 'go');
     assert.equal(await overlay.execute(`typeof SystemAudioCapture`), 'function');
     assert.equal(await overlay.execute(`document.getElementById('activeSkill').disabled`), false);
+    for (const id of ['infoButton', 'settingsIndicator', 'quitButton']) {
+      assert.equal(await overlay.execute(`(() => { const rect = document.getElementById('${id}').getBoundingClientRect(); return rect.width > 20 && rect.left >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight; })()`), true, `${id} must fit inside the actual overlay`);
+    }
+    await overlay.execute(`document.getElementById('infoButton').click();`);
+    await delay(350);
+    assert.equal(await overlay.execute(`document.getElementById('infoButton').getAttribute('aria-expanded')`), 'true');
+    assert.equal(await overlay.execute(`document.getElementById('shortcutsPopover').getBoundingClientRect().bottom <= innerHeight`), true);
+    await overlay.execute(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));`);
+    await delay(350);
+    assert.equal(await overlay.execute(`document.getElementById('infoButton').getAttribute('aria-expanded')`), 'false');
+    await overlay.execute(`document.getElementById('quitButton').click();`);
+    await delay(50);
+    assert.equal(quitRequests, 1);
     assert.deepEqual(overlay.errors, []);
     assert.deepEqual(captureErrors, []);
     console.log('Electron UI smoke checks passed: settings, onboarding, chat errors, live response streaming, concurrent requests, final code formatting, clearing and scrolling during generation.');
     app.exit(0);
   } catch (error) {
-    console.error('UI smoke check failed:', error.message);
+    console.error('UI smoke check failed:', error.stack || error.message);
     app.exit(1);
   }
 });

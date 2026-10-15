@@ -278,6 +278,10 @@ class MainWindowUI {
         this.micButton = document.getElementById('micButton');
     this.infoButton = document.getElementById('infoButton');
     this.shortcutsPopover = document.getElementById('shortcutsPopover');
+        this.quitButton = document.getElementById('quitButton');
+        this.quitButton?.addEventListener('click', () => {
+            if (this.isInteractive) window.electronAPI.quit();
+        });
 
         // NEW: Screenshot button is the first .command-item without id
         const commandItems = document.querySelectorAll('.command-item');
@@ -305,7 +309,7 @@ class MainWindowUI {
         if (this.settingsIndicator) {
             this.settingsIndicator.addEventListener('click', () => {
                 if (this.isInteractive) {
-                    this.showSettingsMenu();
+                    this.openSettings();
                 }
             });
         }
@@ -381,10 +385,13 @@ class MainWindowUI {
                 this.toggleShortcutsPopover();
             });
 
-            // Hover to show
+            // Keep a click-opened popover alive while the pointer returns.
             this.infoButton.addEventListener('mouseenter', () => {
                 if (!this.isInteractive) return;
-                this.showShortcutsPopover();
+                if (this._popoverHideTimeout) {
+                    clearTimeout(this._popoverHideTimeout);
+                    this._popoverHideTimeout = null;
+                }
             });
             // Queue hide when leaving the button
             this.infoButton.addEventListener('mouseleave', () => this.queueHideShortcutsPopover());
@@ -1126,6 +1133,7 @@ class MainWindowUI {
             this._popoverHideTimeout = null;
         }
     this.shortcutsPopover.classList.add('is-open');
+        this.infoButton?.setAttribute('aria-expanded', 'true');
         // Resize main window to fit popover
         setTimeout(() => this.resizeWindowToContent(), 50);
     }
@@ -1133,6 +1141,7 @@ class MainWindowUI {
     hideShortcutsPopover() {
         if (!this.shortcutsPopover) return;
     this.shortcutsPopover.classList.remove('is-open');
+        this.infoButton?.setAttribute('aria-expanded', 'false');
     // resize back to compact after transition
     setTimeout(() => this.resizeWindowToContent(), 130);
     }

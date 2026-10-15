@@ -1277,19 +1277,15 @@
         whysperAPI.onSpeechStatus((event, data) => {
           if (data && data.status) {
             addMessage(data.status, 'system');
-
-            if (data.status.includes('started') || data.status.includes('Recording')) {
-              handleRecordingStarted();
-            } else if (data.status.includes('stopped') || data.status.includes('ended')) {
-              handleRecordingStopped();
-            }
+            // Recording state comes from explicit IPC events. In particular,
+            // "Recording stopped" must not match "Recording" and restart it.
           }
         });
 
         // Listen for speech errors
         whysperAPI.onSpeechError((event, data) => {
           if (data && data.error) {
-            addMessage(`Error in recognizing speech`, 'error');
+            addMessage(`Speech recognition error: ${data.error}`, 'error');
             handleRecordingStopped();
           }
         });

@@ -9,6 +9,8 @@ const FirstRunManager = require('../src/core/first-run');
 const config = require('../src/core/config');
 const { DEFAULTS } = require('../src/core/ai-settings');
 const { parse: parseTranscribeLanguages } = require('../src/core/gemini-transcribe-languages');
+const dialogueLanguages = require('../src/core/dialogue-languages');
+const { parseVocabulary } = require('../src/core/transcription-vocabulary');
 const { validateEndpoint } = require('../src/services/ai-http');
 const { configureNetworkSession } = require('../src/core/network-session');
 const catalogue = require('../src/core/skills');
@@ -17,10 +19,11 @@ const silentLogger = { debug() {}, info() {}, warn() {}, error() {}, logPerforma
 
 test('OpenAI routing preserves skill expertise for both voice and typed questions', async () => {
   const requests = [];
-  const context = { module: { exports: {} }, process: { env: {} }, require: name => {
+  const context = { module: { exports: {} }, process: { env: { DIALOGUE_LANGUAGES: 'ru-RU' } }, require: name => {
     if (name === '@google/genai') return { GoogleGenAI: class {} };
     if (name.includes('logger')) return { createServiceLogger: () => silentLogger };
     if (name === '../core/config') return config;
+    if (name === '../core/dialogue-languages') return dialogueLanguages;
     if (name === '../../prompt-loader') return { promptLoader };
     if (name === '../core/ai-settings') return { getAISettings: () => ({ provider: 'openai', configured: true, model: 'test-model' }) };
     if (name === './openai-compatible.service') return { complete: async (request, onDelta) => {
@@ -45,6 +48,7 @@ test('OpenAI routing preserves skill expertise for both voice and typed question
   assert.match(requests[0].systemInstruction.parts[0].text, /Go/);
   assert.match(requests[1].systemInstruction.parts[0].text, /product, data, business or systems analyst/);
   for (const request of requests) {
+    assert.match(request.systemInstruction.parts.at(-1).text, /Write answer explanations in Russian/);
     const instructions = request.systemInstruction.parts[0].text;
     assert.match(instructions, /Live interview response style/);
     assert.match(instructions, /2-5 short sentences/);
@@ -67,7 +71,7 @@ function mainController(env = {}) {
   const broadcasts = [];
   const speechService = Object.assign(new EventEmitter(), { isRecording: false, isProcessingAudio: false, initializeClient() { this.initializations = (this.initializations || 0) + 1; }, isAvailable: () => true });
   const llmService = { initializeClient() { this.initializations = (this.initializations || 0) + 1; } };
-  const context = { process: { env }, skills: catalogue, config, DEFAULTS, parseTranscribeLanguages, validateEndpoint, configureNetworkSession, logger: silentLogger,
+  const context = { process: { env }, skills: catalogue, config, DEFAULTS, parseTranscribeLanguages, parseVocabulary, getDialogueLanguages: dialogueLanguages.getDialogueLanguages, validateEndpoint, configureNetworkSession, logger: silentLogger,
     speechService, llmService, sessionManager: { setActiveSkill(skill) { this.skill = skill; } },
     windowManager: { broadcastToAllWindows: (channel, data) => broadcasts.push({ channel, data }) },
     require, Buffer, path, fs, BrowserWindow: { getAllWindows: () => [] }, formatEnvValue: value => String(value), ENV_PATH: 'unused' };
@@ -157,6 +161,28 @@ test('invalid settings and speech changes during capture leave current configura
   assert.equal(controller.saveSettings({ speechProvider: 'cloudflare' }).success, false);
   assert.equal(context.process.env.SPEECH_PROVIDER, 'whisper');
   assert.equal(controller.saveSettings({ codingLanguage: 'go' }).success, true);
+});
+
+test('global dialogue languages persist, override legacy hints and cannot change during capture', () => {
+  const { controller, context } = mainController({ GEMINI_TRANSCRIBE_LANGUAGES: 'en-US' });
+  assert.deepEqual([...controller.getSettings().dialogueLanguages], ['en-US']);
+  assert.equal(controller.saveSettings({ dialogueLanguages: ['ru-ru', 'en-US'], geminiModel: 'custom-gemini' }).success, true);
+  assert.equal(context.process.env.DIALOGUE_LANGUAGES, 'ru-RU,en-US');
+  assert.equal(context.process.env.GEMINI_MODEL, 'custom-gemini');
+  assert.equal(controller.getSettings().geminiModel, 'custom-gemini');
+  assert.deepEqual([...controller.getSettings().dialogueLanguages], ['ru-RU', 'en-US']);
+  assert.equal(context.speechService.initializations, 1);
+  assert.equal(controller.saveSettings({ dialogueLanguages: ['invalid'] }).success, false);
+  context.speechService.isRecording = true;
+  assert.equal(controller.saveSettings({ dialogueLanguages: [] }).success, false);
+  assert.equal(context.process.env.DIALOGUE_LANGUAGES, 'ru-RU,en-US');
+  context.speechService.isRecording = false;
+  assert.equal(controller.saveSettings({ dialogueLanguages: [] }).success, true);
+  assert.deepEqual([...controller.getSettings().dialogueLanguages], []);
+  // An explicit empty global selection must also override unmigrated hints.
+  const legacy = mainController({ GEMINI_TRANSCRIBE_LANGUAGES: 'ru-RU' });
+  assert.equal(legacy.controller.saveSettings({ dialogueLanguages: [] }).success, true);
+  assert.equal(legacy.context.speechService.initializations, 1);
 });
 
 test('Live selections persist and a shared Gemini key cannot change during Live capture', () => {
@@ -298,6 +324,62 @@ test('a failed config write does not update runtime credentials', () => {
   assert.equal(context.process.env.OPENAI_API_KEY, 'old-test-key');
 });
 
+test('short spoken words and single-letter terms reach the answer model while punctuation is ignored', async () => {
+  const { controller, context } = mainController();
+  const questions = [];
+  context.sessionManager.addModelResponse = () => {};
+  context.llmService.processTranscriptionWithIntelligentResponseStream = async text => {
+    questions.push(text);
+    return { response: 'Answer', metadata: {} };
+  };
+  controller.shouldShowVoiceOverlay = () => false;
+  controller.sendToVoiceResponseWindows = () => {};
+  controller.sendTranscriptionLLMResponseToVoiceTargets = () => {};
+  for (const text of ['I', 'R', 'да', 'OK', '是', '...', ' ']) {
+    await controller.processTranscriptionWithLLM(text, { recent: [] });
+  }
+  assert.deepEqual(questions, ['I', 'R', 'да', 'OK', '是']);
+});
+
+test('Transcribe vocabulary validates, persists and requires capture to stop before changing hints', () => {
+  const { controller, context } = mainController({ SPEECH_PROVIDER: 'gemini-live' });
+  assert.ok(controller.getSettings().geminiTranscribeVocabulary.includes('KVCache'));
+  assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: 'KVCache, PyTorch,KVCache' }).success, true);
+  assert.equal(context.process.env.GEMINI_TRANSCRIBE_VOCABULARY, 'KVCache,PyTorch');
+  assert.deepEqual(controller.getSettings().geminiTranscribeVocabulary, ['KVCache', 'PyTorch']);
+  assert.equal(context.speechService.initializations, 1);
+  assert.equal(context.llmService.initializations, undefined);
+  context.speechService.isRecording = true;
+  assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: [] }).success, false);
+  context.speechService.isRecording = false;
+  assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: [] }).success, true);
+  assert.deepEqual(controller.getSettings().geminiTranscribeVocabulary, []);
+  for (const value of [['bad\nterm'], Array(101).fill('term'), ['x'.repeat(101)]]) {
+    assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: value }).success, false);
+  }
+});
+
+test('main overlay resize accepts only its own sender and keeps actions within a monitor with negative coordinates', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
+  const start = source.indexOf('    ipcMain.handle("resize-window"');
+  const end = source.indexOf('    ipcMain.handle("move-window"', start);
+  let resize;
+  const sizes = [], positions = [];
+  const window = { webContents: {}, getBounds: () => ({ x: -50, y: 0, width: 520, height: 35 }),
+    setContentSize: (width, height) => sizes.push([width, height]), setPosition: (x, y) => positions.push([x, y]) };
+  vm.runInNewContext(source.slice(start, end), {
+    ipcMain: { handle: (_channel, handler) => { resize = handler; } }, logger: silentLogger,
+    windowManager: { getWindow: () => window },
+    screen: { getDisplayMatching: () => ({ workArea: { x: -1280, y: -100, width: 1280, height: 1024 } }) }
+  });
+  resize({ sender: {} }, { width: 900, height: 400 });
+  resize({ sender: window.webContents }, { width: NaN, height: 400 });
+  assert.equal(sizes.length, 0);
+  resize({ sender: window.webContents }, { width: 900, height: 400 });
+  assert.deepEqual(sizes, [[900, 400]]);
+  assert.deepEqual(positions, [[-900, 0]]);
+});
+
 test('first-run accepts the selected OpenAI provider without a Gemini key', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-onboarding-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -324,11 +406,14 @@ function speechService(transcribe = async () => 'A question', sdk = null) {
     warmup() { workerCalls++; return Promise.resolve({}); }
     releaseWhenIdle() {} close() {}
   }
-  const context = { EventEmitter, WhisperWorkerService: Worker, logger: silentLogger, config, sdk, Buffer, require,
+  const context = { EventEmitter, WhisperWorkerService: Worker, logger: silentLogger, config, sdk, Buffer, require: name => {
+    if (name.startsWith('../core/')) return require('../src/core/' + name.slice('../core/'.length));
+    return require(name);
+  },
     fs, os, path, spawnSync() { assert.fail('Cloudflare must not probe a local executable'); },
     process: { env: { SPEECH_PROVIDER: 'cloudflare', WHISPER_CAPTURE_MODE: 'manual' }, platform: 'win32' },
     cloudflareSpeech: { isConfigured: () => true, transcribe }, startNativeCapture() { assert.fail('Windows must use renderer system audio'); },
-    setTimeout, clearTimeout, setInterval, clearInterval, setImmediate };
+    AbortController, setTimeout, clearTimeout, setInterval, clearInterval, setImmediate };
   vm.runInNewContext(source.slice(start, end) + '\nthis.Speech = SpeechService;', context);
   const service = new context.Speech();
   service.on('error', () => {});

@@ -26,7 +26,7 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 16px;
+        gap: 8px;
         padding: 0 12px;
         color: rgba(255, 255, 255, 0.9);
         font-size: 11px;
@@ -35,9 +35,9 @@
         flex-wrap: nowrap;
         overflow: visible;
         border: 1px solid rgba(255, 255, 255, 0.15);
-  width: 100%;
-  /* Allow horizontal collapse to approximately one icon's width */
-  min-width: 60px;
+        width: max-content;
+        box-sizing: border-box;
+        min-width: 60px;
       }
 
       .command-item {
@@ -51,8 +51,11 @@
         cursor: pointer;
         transition: all 0.2s ease;
         -webkit-app-region: no-drag;
-  /* Allow items to shrink so the bar can collapse to one icon width */
-  flex-shrink: 1;
+        /* Keep action buttons readable while the window fits the toolbar. */
+        flex-shrink: 0;
+        border: 0;
+        background: transparent;
+        font-family: inherit;
       }
 
       .command-item:hover {
@@ -85,17 +88,21 @@
         color: #4caf50;
       }
 
-      /* Small round info button */
+      /* Text label stays visible even if the icon font is unavailable. */
       #infoButton {
-        width: 26px;
+        width: auto;
         height: 26px;
-        border-radius: 9999px;
+        border-radius: 6px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        padding: 0;
+        padding: 0 8px;
       }
       #infoButton i { font-size: 14px; }
+      #infoButton span { color: inherit; }
+      #quitButton { color: #ff8390; }
+      #quitButton:hover { background: rgba(255, 71, 87, 0.15); }
+      .command-item:focus-visible { outline: 1px solid #93c5fd; outline-offset: -1px; }
       #infoButton:hover {
         background: rgba(96, 165, 250, 0.18);
         color: #93c5fd;
@@ -385,9 +392,11 @@
         </select>
       </div>
       <div class="command-separator"></div>
-      <div class="command-item" id="infoButton" title="Shortcuts">
-        <i class="fas fa-circle-info"></i>
-      </div>
+      <button type="button" class="command-item" id="infoButton" title="Keyboard shortcuts" aria-controls="shortcutsPopover" aria-expanded="false">
+        <span aria-hidden="true">?</span><span>Shortcuts</span>
+      </button>
+      <button type="button" class="command-item" id="settingsIndicator" title="Open settings">Settings</button>
+      <button type="button" class="command-item" id="quitButton" title="Quit OpenCluely">Quit</button>
       <div class="command-separator"></div>
       <div class="status-dot non-interactive" id="statusDot"></div>
     </div>

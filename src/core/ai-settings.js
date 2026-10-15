@@ -1,8 +1,11 @@
 // Shared by runtime configuration and first-run detection. No SDK side effects.
 const DEFAULTS = {
+  dialogueLanguages: '',
+  geminiModel: 'gemini-3.1-flash-lite',
   geminiLiveModel: 'gemini-3.8-live',
   geminiLiveTranscribeModel: 'gemini-3.5-transcribe-live',
   geminiTranscribeLanguages: '',
+  geminiTranscribeVocabulary: require('./transcription-vocabulary').DEFAULT_VOCABULARY.join(','),
   openaiModel: 'gpt-4o-mini',
   openaiBaseUrl: 'https://api.openai.com/v1',
   cloudflareModel: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',

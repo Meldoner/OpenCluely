@@ -71,8 +71,10 @@ function electronFetch() {
 }
 
 // Chromium follows system proxy/PAC settings. Native Node HTTPS does not.
-async function requestWithFetch(fetchImpl, url, { apiKey, body, payload, contentType, timeout, onEvent }) {
+async function requestWithFetch(fetchImpl, url, { apiKey, body, payload, contentType, timeout, onEvent, signal }) {
   const controller = new AbortController();
+  const onAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener('abort', onAbort, { once: true });
   const deadline = setTimeout(() => controller.abort(), timeout);
   let reader;
   try {
@@ -105,20 +107,23 @@ async function requestWithFetch(fetchImpl, url, { apiKey, body, payload, content
     if (result.success === false || result.error || result.errors?.length) throw apiError(result, response.status, apiKey, body);
     return result;
   } catch (error) {
+    if (signal?.aborted) throw signal.reason || new Error('AI request cancelled');
     if (controller.signal.aborted) throw new Error('AI request timeout');
     if (error instanceof SyntaxError) throw new SyntaxError('Invalid JSON returned by the AI endpoint');
     throw error;
   } finally {
     clearTimeout(deadline);
+    signal?.removeEventListener('abort', onAbort);
     if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
   }
 }
 
-function request(urlValue, { apiKey, body, contentType = 'application/json', timeout = 60000, onEvent, fetchImpl } = {}) {
+function request(urlValue, { apiKey, body, contentType = 'application/json', timeout = 60000, onEvent, fetchImpl, signal } = {}) {
+  if (signal?.aborted) return Promise.reject(signal.reason || new Error('AI request cancelled'));
   const url = validateEndpoint(urlValue);
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
   const fetchTransport = fetchImpl || electronFetch();
-  if (fetchTransport) return requestWithFetch(fetchTransport, url, { apiKey, body, payload, contentType, timeout, onEvent });
+  if (fetchTransport) return requestWithFetch(fetchTransport, url, { apiKey, body, payload, contentType, timeout, onEvent, signal });
   return new Promise((resolve, reject) => {
     let settled = false;
     let req;
@@ -126,9 +131,12 @@ function request(urlValue, { apiKey, body, contentType = 'application/json', tim
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
+      signal?.removeEventListener('abort', onAbort);
       if (error) { if (req) req.destroy(); reject(error); } else resolve(value);
     };
     const deadline = setTimeout(() => finish(new Error('AI request timeout')), timeout);
+    const onAbort = () => finish(signal.reason || new Error('AI request cancelled'));
+    signal?.addEventListener('abort', onAbort, { once: true });
     try {
       req = (url.protocol === 'https:' ? https : http).request(url, {
         method: 'POST',

@@ -48,7 +48,7 @@ class WhisperWorkerService {
       language: options.language || 'auto',
       model_dir: options.modelDir || null,
       device: options.device || 'auto'
-    });
+    }, 180000, { signal: options.signal });
     this._scheduleIdleUnload();
     return result;
   }
@@ -91,7 +91,7 @@ class WhisperWorkerService {
     this.process = child;
 
     const lines = readline.createInterface({ input: child.stdout });
-    lines.on('line', (line) => this._handleLine(line));
+    lines.on('line', (line) => { if (this.process === child) this._handleLine(line); });
 
     child.stderr.on('data', (chunk) => {
       const message = chunk.toString().trim();
@@ -101,11 +101,14 @@ class WhisperWorkerService {
     });
 
     child.on('error', (error) => {
+      if (this.process !== child) return;
       logger.error('Whisper worker process error', { error: error.message });
-      this._rejectAll(error);
+      this.close(error);
     });
 
     child.on('close', (code) => {
+      lines.close();
+      if (this.process !== child) return;
       const error = new Error(`Whisper worker exited with code ${code}`);
       if (!this.closing && code !== 0) {
         logger.error(error.message);
@@ -151,25 +154,31 @@ class WhisperWorkerService {
     }
   }
 
-  _request(payload, timeoutMs = 180000) {
+  _request(payload, timeoutMs = 180000, { signal } = {}) {
+    if (signal?.aborted) return Promise.reject(signal.reason);
     this._ensureProcess();
+    const child = this.process;
     const id = ++this.sequence;
     const request = { ...payload, id };
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`Whisper worker timed out after ${timeoutMs}ms`));
+        this.close(Object.assign(new Error(`Whisper worker timed out after ${timeoutMs}ms`), { code: 'WHISPER_TIMEOUT' }));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-
-      this.process.stdin.write(`${JSON.stringify(request)}\n`, (error) => {
-        if (error) {
-          clearTimeout(timer);
-          this.pending.delete(id);
-          reject(error);
-        }
+      const onAbort = () => this.close(signal.reason);
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); };
+      this.pending.set(id, {
+        resolve: value => { cleanup(); resolve(value); },
+        reject: error => { cleanup(); reject(error); }, timer
       });
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) { onAbort(); return; }
+
+      try {
+        child.stdin.write(`${JSON.stringify(request)}\n`, (error) => {
+          if (error && this.process === child) this.close(error);
+        });
+      } catch (error) { if (this.process === child) this.close(error); }
     });
   }
 
@@ -200,19 +209,19 @@ class WhisperWorkerService {
     this.pending.clear();
   }
 
-  close() {
+  close(reason = new Error('Whisper worker closed')) {
     this._clearIdleTimer();
     if (this.process && !this.process.killed) {
       try {
         this.closing = true;
         this.process.kill();
-      } catch (_) {
-        // Ignore shutdown races.
+      } catch (error) {
+        logger.warn('Could not stop Whisper worker', { error: error.message });
       }
     }
     this.process = null;
     this.readyInfo = null;
-    this._rejectAll(new Error('Whisper worker closed'));
+    this._rejectAll(reason);
   }
 }
 

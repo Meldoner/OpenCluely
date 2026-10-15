@@ -159,7 +159,7 @@
 
   // ── Wire up: API key ──────────────────────────────────────────────
   const providerUI = new ProviderSettings($('#onboardingProviderSettings'));
-  const transcribeLanguages = new GeminiTranscribeSettings($('#geminiTranscribeOnboardingLanguages'));
+  const transcribeLanguages = new GeminiTranscribeSettings($('#geminiTranscribeOnboardingLanguages'), undefined, { global: true });
   const keyStatus = $('#keyStatus');
   function setKeyStatus(status, text) {
     keyStatus.className = 'status-pill ' + status;
@@ -518,7 +518,7 @@
         };
         if (['gemini-live', 'gemini-live-audio'].includes(state.speechProvider)) {
           payload.geminiKey = $('#geminiLiveSpeechKey').value.trim();
-          if (state.speechProvider === 'gemini-live') payload.geminiTranscribeLanguages = transcribeLanguages.values();
+          if (state.speechProvider === 'gemini-live') payload.dialogueLanguages = transcribeLanguages.values();
           providerUI.inputs.get('geminiKey').value = payload.geminiKey;
         }
         if (state.speechProvider === 'cloudflare') {
@@ -660,7 +660,7 @@
   if (window.electronAPI) {
     window.electronAPI.getSettings().then(settings => {
       providerUI.load(settings);
-      transcribeLanguages.load(settings.geminiTranscribeLanguages || []);
+      transcribeLanguages.load(settings.dialogueLanguages ?? settings.geminiTranscribeLanguages ?? []);
     }).catch(() => {});
   }
 })();

@@ -156,7 +156,7 @@ test('setup timeout, server errors and shutdown reject pending operations', asyn
   await cancelled;
 });
 
-function speechService(manual, transport, audioAnswers = false, languages = '', envOverrides = {}) {
+function speechService(manual, transport, audioAnswers = false, languages = '', envOverrides = {}, recoveringTransports = null) {
   const source = fs.readFileSync(path.join(__dirname, '../src/services/speech.service.js'), 'utf8');
   const context = {
     EventEmitter, WhisperWorkerService: class { close() {} }, logger: silentLogger, config,
@@ -165,8 +165,12 @@ function speechService(manual, transport, audioAnswers = false, languages = '', 
     require: name => {
       if (name === '../core/ai-settings') return require('../src/core/ai-settings');
       if (name === '../core/gemini-transcribe-languages') return transcribeLanguages;
+      if (name === '../core/transcription-vocabulary') return require('../src/core/transcription-vocabulary');
       if (name === './gemini-live.service') return {
         createTranscription: options => live.createTranscription({ ...options, ...sessionOptions(transport) }),
+        createRecoveringTranscription: options => recoveringTransports
+          ? new (require('../src/services/gemini-transcription-retry.service'))(() => live.createTranscription({ ...options, ...sessionOptions(recoveringTransports.shift()) }), { retryDelayMs: 1, replayDelayMs: 0 })
+          : live.createTranscription({ ...options, ...sessionOptions(transport) }),
         createAudioConversation: (request, options) => live.createAudioConversation(request, { ...options, ...sessionOptions(transport) })
       };
       assert.fail('Unexpected dependency: ' + name);
@@ -223,6 +227,29 @@ test('manual Live speech waits for the final transcript after Stop and uses acti
   service.stopRecording(); await stopped;
   assert.deepEqual(final, ['First part Final question']);
   assert.deepEqual(transport.messages.at(-1), { realtimeInput: { activityEnd: {} } });
+});
+
+test('actual speech capture stays active through Live reconnection and Stop waits for the replayed final phrase', async t => {
+  const first = new Transport(), second = new Transport({ final: 'Recovered final phrase' });
+  const service = speechService(true, first, false, '', {}, [first, second]);
+  t.after(() => service.shutdown());
+  const transcripts = [];
+  let starts = 0, stops = 0;
+  service.on('transcription', text => transcripts.push(text));
+  service.on('recording-started', () => starts++);
+  service.on('recording-stopped', () => stops++);
+  service.startRecording(); await tick();
+  service.handleAudioChunkFromRenderer(Buffer.alloc(3200, 60));
+  first.emit('error', new Error('offline'));
+  assert.equal(service.isRecording, true);
+  const stopped = new Promise(resolve => service.on('status', status => { if (status === 'Recording stopped') resolve(); }));
+  service.stopRecording();
+  assert.equal(service.isProcessingAudio, true);
+  await stopped;
+  assert.deepEqual(transcripts, ['Recovered final phrase']);
+  assert.equal(second.messages.filter(message => message.realtimeInput?.audio).length, 1);
+  assert.equal(starts, 1); assert.equal(stops, 1);
+  assert.equal(service.isProcessingAudio, false);
 });
 
 test('stopping pending Live setup prevents capture and connection failure stops active capture', async () => {
@@ -396,10 +423,11 @@ test('isolated WebSocket preload decodes messages in order, drops audio and reje
 test('LLM routes voice, text and screenshots to Live and never retries partial Live streams', async () => {
   const requests = [];
   let fail = false;
-  const context = { module: { exports: {} }, Buffer, process: { env: {} }, require: name => {
+  const context = { module: { exports: {} }, Buffer, process: { env: { DIALOGUE_LANGUAGES: 'ru-RU' } }, require: name => {
     if (name === '@google/genai') return { GoogleGenAI: class {} };
     if (name.includes('logger')) return { createServiceLogger: () => silentLogger };
     if (name === '../core/config') return config;
+    if (name === '../core/dialogue-languages') return require('../src/core/dialogue-languages');
     if (name === '../../prompt-loader') return { promptLoader };
     if (name === '../core/ai-settings') return { getAISettings: () => getAISettings({ LLM_PROVIDER: 'gemini-live', GEMINI_API_KEY: 'test-key' }) };
     if (name === './openai-compatible.service') return { complete() { assert.fail('Live must not use Chat Completions'); } };
@@ -424,6 +452,7 @@ test('LLM routes voice, text and screenshots to Live and never retries partial L
   await llm.processTranscriptionWithIntelligentResponseStream('Explain evals', 'ai-engineer', [], null, () => {});
   await llm.processImageWithSkillStream(Buffer.from('image'), 'image/png', 'analyst', [], null, () => {});
   assert.equal(requests.length, 3);
+  for (const request of [audioRequest, ...requests]) assert.match(request.systemInstruction.parts.at(-1).text, /Write answer explanations in Russian/);
   assert.match(requests[0].systemInstruction.parts[0].text, /Live interview response style/);
   assert.match(requests[1].systemInstruction.parts[0].text, /AI application engineer/);
   assert.equal(requests[2].contents[0].parts[1].inlineData.data, Buffer.from('image').toString('base64'));
