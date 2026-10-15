@@ -229,6 +229,26 @@ test('manual Live speech waits for the final transcript after Stop and uses acti
   assert.deepEqual(transport.messages.at(-1), { realtimeInput: { activityEnd: {} } });
 });
 
+test('Live speech sends the active skill glossary and respects per-skill overrides and empty lists', async () => {
+  const examples = { dsa: 'BFS', devops: 'Kubernetes', analyst: 'ARPU', backend: 'MVCC', 'ml-engineer': 'CatBoost', 'ai-engineer': 'KVCache' };
+  for (const [skill, term] of Object.entries(examples)) {
+    const transport = new Transport();
+    const service = speechService(false, transport, false, '', { ACTIVE_SKILL: skill });
+    try {
+      service.startRecording(); await tick();
+      assert.ok(transport.messages[0].setup.inputAudioTranscription.customVocabulary.includes(term), skill);
+    } finally { service.shutdown(); }
+  }
+  for (const value of ['MyModel,KVCache', '']) {
+    const transport = new Transport();
+    const service = speechService(false, transport, false, '', { ACTIVE_SKILL: 'ai-engineer', GEMINI_TRANSCRIBE_VOCABULARY_AI_ENGINEER: value });
+    try {
+      service.startRecording(); await tick();
+      assert.deepEqual(transport.messages[0].setup.inputAudioTranscription.customVocabulary, value ? ['MyModel', 'KVCache'] : []);
+    } finally { service.shutdown(); }
+  }
+});
+
 test('actual speech capture stays active through Live reconnection and Stop waits for the replayed final phrase', async t => {
   const first = new Transport(), second = new Transport({ final: 'Recovered final phrase' });
   const service = speechService(true, first, false, '', {}, [first, second]);
@@ -392,9 +412,11 @@ test('isolated WebSocket preload decodes messages in order, drops audio and reje
   let socket;
   class Socket {
     static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
     constructor(url) { this.url = url; this.readyState = 1; this.bufferedAmount = 0; socket = this; }
     send(text) { this.sent = text; }
-    close() { this.closed = true; }
+    close(code) { this.closed = true; this.closeCode = code; this.readyState = Socket.CLOSED; this.onclose?.({ code }); }
   }
   const source = fs.readFileSync(path.join(__dirname, '../src/ui/gemini-live-preload.js'), 'utf8');
   const context = { require: () => ({ ipcRenderer: ipc }), URL, WebSocket: Socket, window: { addEventListener() {} } };
@@ -418,6 +440,11 @@ test('isolated WebSocket preload decodes messages in order, drops audio and reje
   ipc.emit('gemini-live-send', {}, '{}');
   assert.equal(events.at(-1).type, 'error');
   assert.equal(socket.sent, undefined);
+  ipc.emit('gemini-live-close');
+  await tick();
+  assert.equal(socket.closeCode, 1000);
+  assert.equal(events.at(-1).type, 'close');
+  assert.equal(events.at(-1).data, 1000);
 });
 
 test('LLM routes voice, text and screenshots to Live and never retries partial Live streams', async () => {

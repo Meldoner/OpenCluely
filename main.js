@@ -112,7 +112,7 @@ const skills = require('./src/core/skills');
 const { DEFAULTS } = require('./src/core/ai-settings');
 const { parse: parseTranscribeLanguages } = require('./src/core/gemini-transcribe-languages');
 const { getDialogueLanguages } = require('./src/core/dialogue-languages');
-const { parseVocabulary } = require('./src/core/transcription-vocabulary');
+const { parseVocabulary, vocabularyEnvKey, getSkillVocabulary, legacyVocabularyUpdates } = require('./src/core/transcription-vocabulary');
 const { validateEndpoint } = require('./src/services/ai-http');
 const { configureSystemAudioSession } = require('./src/core/system-audio-session');
 
@@ -132,7 +132,8 @@ class ApplicationController {
     // call instead of several slow, half-answered ones.
     this._utteranceBuffer = "";
     this._utteranceTimer = null;
-    this._utteranceDispatchInFlight = false;
+    this._voiceResponseGeneration = 0;
+    this._voiceResponseIds = new Set();
     this._utteranceCoalesceMs = 800;
 
     // First-run onboarding: detects missing .env / API key and triggers
@@ -1250,6 +1251,11 @@ class ApplicationController {
   clearSessionMemory() {
     speechService.cancelLiveRecording?.();
     this._liveAudioResponses?.clear();
+    this._voiceResponseIds?.clear();
+    this._voiceResponseGeneration = (this._voiceResponseGeneration || 0) + 1;
+    if (this._utteranceTimer) clearTimeout(this._utteranceTimer);
+    this._utteranceTimer = null;
+    this._utteranceBuffer = '';
     sessionManager.clear();
     windowManager.broadcastToAllWindows('session-cleared');
   }
@@ -1322,35 +1328,24 @@ class ApplicationController {
   }
 
   /**
-   * Send the coalesced utterance to the LLM. If a previous dispatch is still
-   * running, leave the buffer intact and let that dispatch's completion pick it
-   * up — so we never pile up overlapping requests for the same person talking.
+   * Send a complete utterance without waiting for previous model responses.
+   * Coalescing only joins fragments within a pause; each ready question gets
+   * its own request and streaming messageId.
    */
   async dispatchCoalescedUtterance() {
-    if (this._utteranceDispatchInFlight) {
-      return;
-    }
     const combined = this._utteranceBuffer.trim();
     if (!combined) {
       return;
     }
     this._utteranceBuffer = "";
-    this._utteranceDispatchInFlight = true;
 
     try {
       const sessionHistory = sessionManager.getOptimizedHistory();
       await this.processTranscriptionWithLLM(combined, sessionHistory);
     } catch (error) {
       logger.error("Failed to process transcription with LLM", {
-        error: error.message,
-        text: combined.substring(0, 100)
+        error: error.message
       });
-    } finally {
-      this._utteranceDispatchInFlight = false;
-      // Anything that arrived while we were busy gets answered now.
-      if (this._utteranceBuffer.trim()) {
-        this.dispatchCoalescedUtterance();
-      }
     }
   }
 
@@ -1358,6 +1353,10 @@ class ApplicationController {
     // Hoisted so the catch block can tie a fallback answer to the same UI
     // bubble the streaming start event created; otherwise a total failure
     // leaves an empty streamed bubble stranded next to the fallback message.
+    const activeSkill = this.activeSkill;
+    const codingLanguage = this.codingLanguage;
+    const generation = this._voiceResponseGeneration || 0;
+    const isCurrent = () => generation === (this._voiceResponseGeneration || 0);
     let messageId = null;
     try {
       // Validate input text
@@ -1373,44 +1372,48 @@ class ApplicationController {
       if (!/[\p{L}\p{N}]/u.test(cleanText)) return;
 
       logger.info("Processing transcription with intelligent LLM response", {
-        skill: this.activeSkill,
+        skill: activeSkill,
         textLength: cleanText.length,
         textPreview: cleanText.substring(0, 100) + "..."
       });
 
       // Check if current skill needs programming language context
       const skillsRequiringProgrammingLanguage = skills.filter(skill => skill.coding).map(skill => skill.id);
-      const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
+      const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(activeSkill);
 
       // Stream the answer progressively to the configured speech target.
       // A unique messageId ties the start/chunk/final events to one bubble so
       // the UI never duplicates or interleaves concurrent responses.
       this._responseSeq = (this._responseSeq || 0) + 1;
       messageId = `tr-${Date.now()}-${this._responseSeq}`;
+      if (!this._voiceResponseIds) this._voiceResponseIds = new Set();
+      this._voiceResponseIds.add(messageId);
       this.sendToVoiceResponseWindows("transcription-llm-response-start", {
         messageId,
-        skill: this.activeSkill
+        skill: activeSkill
       });
       if (this.shouldShowVoiceOverlay()) {
         windowManager.showLLMLoading();
       }
       const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
         cleanText,
-        this.activeSkill,
+        activeSkill,
         sessionHistory.recent,
-        needsProgrammingLanguage ? this.codingLanguage : null,
+        needsProgrammingLanguage ? codingLanguage : null,
         (delta) => {
+          if (!isCurrent()) return;
           this.sendToVoiceResponseWindows("transcription-llm-response-chunk", {
             messageId,
             delta
           });
         }
       );
-      llmResult.metadata = { ...llmResult.metadata, messageId };
+      if (!isCurrent()) return;
+      llmResult.metadata = { ...llmResult.metadata, messageId, skill: activeSkill };
 
       // Add LLM response to session memory
       sessionManager.addModelResponse(llmResult.response, {
-        skill: this.activeSkill,
+        skill: activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
         isTranscriptionResponse: true
@@ -1420,7 +1423,7 @@ class ApplicationController {
       if (this.shouldShowVoiceOverlay()) {
         windowManager.showLLMResponse(llmResult.response, {
           messageId,
-          skill: this.activeSkill,
+          skill: activeSkill,
           processingTime: llmResult.metadata.processingTime,
           usedFallback: llmResult.metadata.usedFallback,
           isTranscriptionResponse: true
@@ -1429,28 +1432,29 @@ class ApplicationController {
 
       logger.info("Transcription LLM response completed", {
         responseLength: llmResult.response.length,
-        skill: this.activeSkill,
-        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : 'not applicable',
+        skill: activeSkill,
+        programmingLanguage: needsProgrammingLanguage ? codingLanguage : 'not applicable',
         processingTime: llmResult.metadata.processingTime
       });
 
     } catch (error) {
+      if (!isCurrent()) return;
       logger.error("Transcription LLM processing failed", {
         error: error.message,
         errorStack: error.stack,
-        skill: this.activeSkill,
+        skill: activeSkill,
         text: text ? text.substring(0, 100) : 'undefined'
       });
 
       if (llmService.provider !== 'gemini') {
         this.broadcastLLMError(error.message, messageId);
-        if (this.shouldShowVoiceOverlay()) windowManager.hideLLMResponse();
+        if (this.shouldShowVoiceOverlay() && this._voiceResponseIds.size <= 1) windowManager.hideLLMResponse();
         return;
       }
 
       // Try to provide a fallback response
       try {
-        const fallbackResult = llmService.generateIntelligentFallbackResponse(text, this.activeSkill);
+        const fallbackResult = llmService.generateIntelligentFallbackResponse(text, activeSkill);
         // Carry the streaming messageId so the target replaces the live
         // bubble instead of leaving it stuck and appending a duplicate.
         if (messageId) {
@@ -1458,7 +1462,7 @@ class ApplicationController {
         }
 
         sessionManager.addModelResponse(fallbackResult.response, {
-          skill: this.activeSkill,
+          skill: activeSkill,
           processingTime: fallbackResult.metadata.processingTime,
           usedFallback: true,
           isTranscriptionResponse: true,
@@ -1469,14 +1473,14 @@ class ApplicationController {
         if (this.shouldShowVoiceOverlay()) {
           windowManager.showLLMResponse(fallbackResult.response, {
             messageId,
-            skill: this.activeSkill,
+            skill: activeSkill,
             processingTime: fallbackResult.metadata.processingTime,
             usedFallback: true,
             isTranscriptionResponse: true
           });
         }
         logger.info("Used fallback response for transcription", {
-          skill: this.activeSkill,
+          skill: activeSkill,
           fallbackResponse: fallbackResult.response
         });
         
@@ -1492,10 +1496,12 @@ class ApplicationController {
           action: 'transcription_llm_error',
           metadata: {
             error: error.message,
-            skill: this.activeSkill
+            skill: activeSkill
           }
         });
       }
+    } finally {
+      this._voiceResponseIds?.delete(messageId);
     }
   }
 
@@ -1627,6 +1633,10 @@ class ApplicationController {
   }
 
   onWillQuit() {
+    this._voiceResponseGeneration = (this._voiceResponseGeneration || 0) + 1;
+    if (this._utteranceTimer) clearTimeout(this._utteranceTimer);
+    this._utteranceTimer = null;
+    this._utteranceBuffer = '';
     globalShortcut.unregisterAll();
     speechService.shutdown();
     require('./src/services/gemini-live.service').shutdown();
@@ -1679,7 +1689,7 @@ class ApplicationController {
       geminiKey: process.env.GEMINI_API_KEY || "",
       geminiModel: process.env.GEMINI_MODEL || DEFAULTS.geminiModel,
       geminiTranscribeLanguages: parseTranscribeLanguages(process.env.GEMINI_TRANSCRIBE_LANGUAGES ?? DEFAULTS.geminiTranscribeLanguages),
-      geminiTranscribeVocabulary: parseVocabulary(process.env.GEMINI_TRANSCRIBE_VOCABULARY ?? DEFAULTS.geminiTranscribeVocabulary),
+      geminiTranscribeVocabulary: getSkillVocabulary(this.activeSkill || 'dsa', process.env),
       llmProvider: process.env.LLM_PROVIDER || 'gemini',
       openaiKey: process.env.OPENAI_API_KEY || '',
       openaiModel: process.env.OPENAI_MODEL || DEFAULTS.openaiModel,
@@ -1702,7 +1712,7 @@ class ApplicationController {
         llmProvider: 'LLM_PROVIDER', geminiKey: 'GEMINI_API_KEY', geminiModel: 'GEMINI_MODEL',
         dialogueLanguages: 'DIALOGUE_LANGUAGES',
         geminiTranscribeLanguages: 'GEMINI_TRANSCRIBE_LANGUAGES',
-        geminiTranscribeVocabulary: 'GEMINI_TRANSCRIBE_VOCABULARY',
+        geminiTranscribeVocabulary: vocabularyEnvKey(settings.geminiTranscribeVocabularySkill ?? settings.activeSkill ?? this.activeSkill ?? 'dsa'),
         openaiKey: 'OPENAI_API_KEY', openaiModel: 'OPENAI_MODEL', openaiBaseUrl: 'OPENAI_BASE_URL',
         cloudflareAccountId: 'CLOUDFLARE_ACCOUNT_ID', cloudflareToken: 'CLOUDFLARE_API_TOKEN',
         cloudflareModel: 'CLOUDFLARE_MODEL', cloudflareWhisperModel: 'CLOUDFLARE_WHISPER_MODEL',
@@ -1719,7 +1729,8 @@ class ApplicationController {
         whisperDevice: ['auto', 'cpu', 'cuda'], whisperCaptureMode: ['vad', 'manual'], whisperResponseTarget: ['chat', 'overlay', 'both'],
         cloudflareWhisperModel: ['@cf/openai/whisper', '@cf/openai/whisper-large-v3-turbo']
       };
-      const updates = {};
+      const updates = settings.activeSkill !== undefined || settings.geminiTranscribeVocabulary !== undefined
+        ? legacyVocabularyUpdates(process.env, this.activeSkill || 'dsa') : {};
       for (const [field, envKey] of Object.entries(mapping)) {
         if (settings[field] === undefined) continue;
         const raw = field === 'geminiTranscribeVocabulary' ? parseVocabulary(settings[field]).join(',')
@@ -1732,7 +1743,8 @@ class ApplicationController {
         if (field === 'whisperSegmentMs' && (!Number.isFinite(Number(value)) || Number(value) < 500 || Number(value) > 90000)) throw new Error('Segment duration must be 500?90000 ms');
         updates[envKey] = value;
       }
-      const changed = Object.keys(updates).filter(key => (process.env[key] || '') !== updates[key]);
+      const changed = Object.keys(updates).filter(key => key.startsWith('GEMINI_TRANSCRIBE_VOCABULARY_')
+        ? process.env[key] !== updates[key] : (process.env[key] || '') !== updates[key]);
       if ((updates.SPEECH_PROVIDER ?? process.env.SPEECH_PROVIDER) === 'gemini-live-audio' &&
           (updates.LLM_PROVIDER ?? process.env.LLM_PROVIDER ?? 'gemini') !== 'gemini-live') {
         throw new Error('Gemini-3.8-Live audio requires Gemini-3.8-Live for answers. Choose another speech provider or select Gemini-3.8-Live in AI Providers.');

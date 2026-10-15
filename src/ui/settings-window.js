@@ -10,6 +10,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const cloudflareWhisperInput = document.getElementById('cloudflareWhisperModel');
     const systemAudioDeviceInput = document.getElementById('systemAudioDevice');
     const vocabularyInput = document.getElementById('geminiTranscribeVocabulary');
+    let vocabularySkill = null;
+    let savedVocabulary = '';
 
     // Get DOM elements
     const closeButton = document.getElementById('closeButton');
@@ -38,7 +40,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Request current settings when window opens
     const requestCurrentSettings = () => {
         if (window.electronAPI && window.electronAPI.getSettings) {
-            window.electronAPI.getSettings().then(settings => {
+            return window.electronAPI.getSettings().then(settings => {
                 loadSettingsIntoUI(settings);
             }).catch(error => {
                 console.error('Failed to get settings:', error);
@@ -82,8 +84,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // Function to load settings into UI
     const loadSettingsIntoUI = (settings) => {
         providerUI.load(settings);
-        const vocabulary = settings.geminiTranscribeVocabulary ?? ['KVCache', 'KV cache', 'key-value cache'];
+        const vocabulary = settings.geminiTranscribeVocabulary ?? [];
         vocabularyInput.value = Array.isArray(vocabulary) ? vocabulary.join(', ') : vocabulary;
+        savedVocabulary = vocabularyInput.value;
+        vocabularySkill = settings.activeSkill || 'dsa';
         dialogueLanguages.load(settings.dialogueLanguages ?? settings.geminiTranscribeLanguages ?? []);
         if (cloudflareWhisperInput) cloudflareWhisperInput.value = settings.cloudflareWhisperModel || "@cf/openai/whisper";
         if (systemAudioDeviceInput) systemAudioDeviceInput.value = settings.systemAudioDevice || "";
@@ -110,6 +114,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (settings.activeSkill && activeSkillSelect) activeSkillSelect.value = settings.activeSkill;
+        const skillLabel = activeSkillSelect.selectedOptions[0]?.textContent || vocabularySkill;
+        document.getElementById('geminiVocabularyLabel').textContent = 'Technical vocabulary — ' + skillLabel;
 
         // Handle icon selection
         const selectedIcon = settings.selectedIcon || settings.appIcon;
@@ -145,13 +151,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.log('Language updated from overlay window:', data.language);
             }
     });
+    window.electronAPI.onSkillChanged(() => requestCurrentSettings());
     }
 
     // Save settings helper function
-    const saveSettings = async () => {
+    const saveSettings = async (options = {}) => {
         const settings = providerUI.values();
         settings.dialogueLanguages = dialogueLanguages.values();
-        settings.geminiTranscribeVocabulary = vocabularyInput.value;
+        // The input still belongs to the previous profile during a skill change.
+        // Send its scope explicitly so blur/change events cannot overwrite another glossary.
+        if (vocabularySkill && vocabularyInput.value !== savedVocabulary) {
+            settings.geminiTranscribeVocabulary = vocabularyInput.value;
+            settings.geminiTranscribeVocabularySkill = vocabularySkill;
+        }
         if (cloudflareWhisperInput) settings.cloudflareWhisperModel = cloudflareWhisperInput.value;
         if (systemAudioDeviceInput) settings.systemAudioDevice = systemAudioDeviceInput.value;
         if (speechProviderSelect) settings.speechProvider = speechProviderSelect.value;
@@ -165,12 +177,19 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
         if (windowGapInput) settings.windowGap = windowGapInput.value;
         if (codingLanguageSelect) settings.codingLanguage = codingLanguageSelect.value;
-        if (activeSkillSelect) settings.activeSkill = activeSkillSelect.value;
+        if (options.activeSkill) settings.activeSkill = options.activeSkill;
         
         try {
             const result = await window.electronAPI.saveSettings(settings);
             if (!result.success) providerUI.status.textContent = result.error;
-        } catch (error) { providerUI.status.textContent = error.message; }
+            else if (settings.geminiTranscribeVocabulary !== undefined && vocabularySkill === settings.geminiTranscribeVocabularySkill) {
+                savedVocabulary = settings.geminiTranscribeVocabulary;
+            }
+            return result;
+        } catch (error) {
+            providerUI.status.textContent = error.message;
+            return { success: false };
+        }
     };
 
     const updateSpeechFieldStates = () => {
@@ -267,10 +286,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Skill selection handler
     if (activeSkillSelect) {
-        activeSkillSelect.addEventListener('change', (e) => {
-            saveSettings();
-            // Also update the main window
-            window.api.send('update-skill', e.target.value);
+        activeSkillSelect.addEventListener('change', async () => {
+            activeSkillSelect.disabled = true;
+            try {
+                const result = await saveSettings({ activeSkill: activeSkillSelect.value });
+                if (result.success) await requestCurrentSettings();
+                else activeSkillSelect.value = vocabularySkill;
+            } finally {
+                activeSkillSelect.disabled = false;
+            }
         });
     }
 

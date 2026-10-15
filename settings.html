@@ -381,9 +381,9 @@
                         <div id="speechCredentials"></div>
                         <div class="settings-item" id="geminiVocabularyFields" hidden>
                             <div class="settings-stack">
-                                <label class="settings-item-label" for="geminiTranscribeVocabulary">Technical vocabulary</label>
-                                <div class="settings-item-description">Gemini Transcribe hints: up to 100 comma-separated terms, e.g. KVCache, Kubernetes, PyTorch. Use the intended spelling. Applied on the next recording.</div>
-                                <input class="input-field" id="geminiTranscribeVocabulary" maxlength="4096" style="max-width:100%;" placeholder="KVCache, KV cache, key-value cache">
+                                <label class="settings-item-label" id="geminiVocabularyLabel" for="geminiTranscribeVocabulary">Technical vocabulary</label>
+                                <div class="settings-item-description">Separate Gemini Transcribe glossary for the selected skill. Edit up to 100 comma-separated terms using their intended spelling. An empty list disables hints for this skill. Applied on the next recording.</div>
+                                <input class="input-field" id="geminiTranscribeVocabulary" maxlength="4096" style="max-width:100%;" placeholder="Terms for the selected skill">
                             </div>
                         </div>
                         <div class="settings-note">Audio source: computer output. Windows uses system loopback; Linux uses the default output monitor. macOS requires a routed virtual loopback device.</div>

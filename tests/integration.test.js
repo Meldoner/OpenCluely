@@ -10,7 +10,7 @@ const config = require('../src/core/config');
 const { DEFAULTS } = require('../src/core/ai-settings');
 const { parse: parseTranscribeLanguages } = require('../src/core/gemini-transcribe-languages');
 const dialogueLanguages = require('../src/core/dialogue-languages');
-const { parseVocabulary } = require('../src/core/transcription-vocabulary');
+const { parseVocabulary, vocabularyEnvKey, getSkillVocabulary, legacyVocabularyUpdates } = require('../src/core/transcription-vocabulary');
 const { validateEndpoint } = require('../src/services/ai-http');
 const { configureNetworkSession } = require('../src/core/network-session');
 const catalogue = require('../src/core/skills');
@@ -71,16 +71,120 @@ function mainController(env = {}) {
   const broadcasts = [];
   const speechService = Object.assign(new EventEmitter(), { isRecording: false, isProcessingAudio: false, initializeClient() { this.initializations = (this.initializations || 0) + 1; }, isAvailable: () => true });
   const llmService = { initializeClient() { this.initializations = (this.initializations || 0) + 1; } };
-  const context = { process: { env }, skills: catalogue, config, DEFAULTS, parseTranscribeLanguages, parseVocabulary, getDialogueLanguages: dialogueLanguages.getDialogueLanguages, validateEndpoint, configureNetworkSession, logger: silentLogger,
+  const context = { process: { env }, skills: catalogue, config, DEFAULTS, parseTranscribeLanguages, parseVocabulary, vocabularyEnvKey, getSkillVocabulary, legacyVocabularyUpdates, getDialogueLanguages: dialogueLanguages.getDialogueLanguages, validateEndpoint, configureNetworkSession, logger: silentLogger,
     speechService, llmService, sessionManager: { setActiveSkill(skill) { this.skill = skill; } },
     windowManager: { broadcastToAllWindows: (channel, data) => broadcasts.push({ channel, data }) },
     require, Buffer, path, fs, BrowserWindow: { getAllWindows: () => [] }, formatEnvValue: value => String(value), ENV_PATH: 'unused' };
   vm.runInNewContext(source.slice(start, end) + '\nthis.Controller = ApplicationController;', context);
   const controller = Object.create(context.Controller.prototype);
-  controller.activeSkill = 'dsa'; controller.codingLanguage = 'cpp';
+  controller.activeSkill = env.ACTIVE_SKILL || 'dsa'; controller.codingLanguage = 'cpp';
   controller.persistEnvUpdates = updates => { Object.assign(env, updates); return Object.keys(updates); };
   return { controller, context, broadcasts };
 }
+
+function voiceController() {
+  const state = mainController();
+  const { controller, context } = state;
+  const timers = new Map(), requests = [], events = [], history = [];
+  let timerId = 0;
+  context.setTimeout = callback => { timers.set(++timerId, callback); return timerId; };
+  context.clearTimeout = id => timers.delete(id);
+  context.speechService.isManualCaptureMode = () => false;
+  context.sessionManager.addUserInput = text => history.push({ role: 'user', content: text });
+  context.sessionManager.addModelResponse = (text, metadata) => history.push({ role: 'model', content: text, metadata });
+  context.sessionManager.getOptimizedHistory = () => ({ recent: [...history] });
+  context.sessionManager.clear = () => { history.length = 0; };
+  context.llmService.provider = 'gemini-live';
+  context.llmService.processTranscriptionWithIntelligentResponseStream = (text, skill, recent, language, onDelta) =>
+    new Promise((resolve, reject) => requests.push({ text, skill, recent, language, onDelta,
+      resolve: response => resolve({ response, metadata: { skill } }), reject }));
+  controller._utteranceBuffer = '';
+  controller._utteranceCoalesceMs = 800;
+  controller.shouldShowVoiceOverlay = () => false;
+  controller.sendToVoiceResponseWindows = (channel, data) => events.push({ channel, data });
+  controller.sendTranscriptionLLMResponseToVoiceTargets = result => events.push({ channel: 'final', data: result });
+  const pause = () => {
+    const callbacks = [...timers.values()]; timers.clear();
+    callbacks.forEach(callback => callback());
+  };
+  return { ...state, timers, requests, events, history, pause };
+}
+
+test('a second spoken question starts before the first answer completes, with independent response IDs', async () => {
+  const { controller, requests, events, history, pause } = voiceController();
+  controller.handleTranscriptionFragment('What is VPC?'); pause();
+  controller.handleTranscriptionFragment('What is SRE?'); pause();
+  assert.equal(requests.length, 2, 'The second question must not wait for the first model response');
+  assert.deepEqual(requests.map(request => request.text), ['What is VPC?', 'What is SRE?']);
+  const starts = events.filter(event => event.channel === 'transcription-llm-response-start');
+  assert.equal(starts.length, 2);
+  assert.notEqual(starts[0].data.messageId, starts[1].data.messageId);
+  requests[1].onDelta('SRE'); requests[1].resolve('SRE answer');
+  await new Promise(setImmediate);
+  assert.equal(events.find(event => event.channel === 'final').data.metadata.messageId, starts[1].data.messageId);
+  controller.activeSkill = 'analyst';
+  requests[0].onDelta('VPC'); requests[0].resolve('VPC answer');
+  await new Promise(setImmediate);
+  assert.deepEqual(events.filter(event => event.channel === 'transcription-llm-response-chunk').map(event => event.data.messageId), [starts[1].data.messageId, starts[0].data.messageId]);
+  assert.deepEqual(history.filter(event => event.role === 'model').map(event => event.content), ['SRE answer', 'VPC answer']);
+  assert.ok(history.filter(event => event.role === 'model').every(event => event.metadata.skill === 'dsa'));
+});
+
+test('finishing one voice answer does not dispatch an unfinished next question before its coalescing pause', async () => {
+  const { controller, requests, timers, pause } = voiceController();
+  controller.handleTranscriptionFragment('First question'); pause();
+  controller.handleTranscriptionFragment('Explain');
+  requests[0].resolve('First answer');
+  await new Promise(setImmediate);
+  assert.equal(requests.length, 1);
+  controller.handleTranscriptionFragment('SRE');
+  assert.equal(timers.size, 1);
+  pause();
+  assert.equal(requests[1].text, 'Explain SRE');
+  requests[1].resolve('Second answer');
+  await new Promise(setImmediate);
+});
+
+test('a failed voice request keeps its error ID and does not hide another answer still streaming', async () => {
+  const { controller, context, requests, events, broadcasts, pause } = voiceController();
+  let hidden = 0;
+  controller.shouldShowVoiceOverlay = () => true;
+  context.windowManager.showLLMLoading = () => {};
+  context.windowManager.showLLMResponse = () => {};
+  context.windowManager.hideLLMResponse = () => { hidden++; };
+  controller.handleTranscriptionFragment('First question'); pause();
+  controller.handleTranscriptionFragment('Second question'); pause();
+  const starts = events.filter(event => event.channel === 'transcription-llm-response-start');
+  requests[0].reject(new Error('Live API error (409)'));
+  await new Promise(setImmediate);
+  assert.equal(broadcasts.find(event => event.channel === 'llm-error').data.messageId, starts[0].data.messageId);
+  assert.equal(hidden, 0);
+  requests[1].onDelta('Second partial'); requests[1].resolve('Second answer');
+  await new Promise(setImmediate);
+  assert.equal(events.find(event => event.channel === 'final').data.metadata.messageId, starts[1].data.messageId);
+  assert.equal(controller._voiceResponseIds.size, 0);
+});
+
+test('clearing voice questions removes buffered input and ignores late chunks, answers and errors', async () => {
+  const { controller, requests, events, history, timers, pause, broadcasts } = voiceController();
+  controller.handleTranscriptionFragment('First question'); pause();
+  controller.handleTranscriptionFragment('Second question'); pause();
+  controller.handleTranscriptionFragment('Buffered old question');
+  controller.clearSessionMemory();
+  assert.equal(timers.size, 0);
+  assert.equal(controller._utteranceBuffer, '');
+  const before = events.length;
+  requests[0].onDelta('Old partial'); requests[0].resolve('Old answer');
+  requests[1].reject(new Error('Old failure'));
+  await new Promise(setImmediate);
+  assert.equal(events.length, before);
+  assert.deepEqual(history, []);
+  assert.equal(broadcasts.some(event => event.channel === 'llm-error'), false);
+  controller.handleTranscriptionFragment('New question'); pause();
+  requests[2].resolve('New answer');
+  await new Promise(setImmediate);
+  assert.deepEqual(history.map(event => event.content), ['New question', 'New answer']);
+});
 
 test('application network setup delegates non-Gemini TLS verification to Chromium', () => {
   const { controller, context } = mainController();
@@ -343,9 +447,9 @@ test('short spoken words and single-letter terms reach the answer model while pu
 
 test('Transcribe vocabulary validates, persists and requires capture to stop before changing hints', () => {
   const { controller, context } = mainController({ SPEECH_PROVIDER: 'gemini-live' });
-  assert.ok(controller.getSettings().geminiTranscribeVocabulary.includes('KVCache'));
+  assert.ok(controller.getSettings().geminiTranscribeVocabulary.includes('BFS'));
   assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: 'KVCache, PyTorch,KVCache' }).success, true);
-  assert.equal(context.process.env.GEMINI_TRANSCRIBE_VOCABULARY, 'KVCache,PyTorch');
+  assert.equal(context.process.env.GEMINI_TRANSCRIBE_VOCABULARY_DSA, 'KVCache,PyTorch');
   assert.deepEqual(controller.getSettings().geminiTranscribeVocabulary, ['KVCache', 'PyTorch']);
   assert.equal(context.speechService.initializations, 1);
   assert.equal(context.llmService.initializations, undefined);
@@ -357,6 +461,40 @@ test('Transcribe vocabulary validates, persists and requires capture to stop bef
   for (const value of [['bad\nterm'], Array(101).fill('term'), ['x'.repeat(101)]]) {
     assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: value }).success, false);
   }
+});
+
+test('skill vocabulary edits keep their original scope while switching profiles and survive restart', () => {
+  const { controller, context } = mainController({ SPEECH_PROVIDER: 'gemini-live' });
+  assert.equal(controller.saveSettings({ activeSkill: 'devops', geminiTranscribeVocabulary: 'CustomDSA', geminiTranscribeVocabularySkill: 'dsa' }).success, true);
+  assert.equal(context.process.env.GEMINI_TRANSCRIBE_VOCABULARY_DSA, 'CustomDSA');
+  assert.ok(controller.getSettings().geminiTranscribeVocabulary.includes('Kubernetes'));
+  assert.equal(controller.getSettings().geminiTranscribeVocabulary.includes('CustomDSA'), false);
+  assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: '' }).success, true);
+  assert.deepEqual(controller.getSettings().geminiTranscribeVocabulary, []);
+  assert.equal(controller.saveSettings({ activeSkill: 'dsa' }).success, true);
+  assert.deepEqual(controller.getSettings().geminiTranscribeVocabulary, ['CustomDSA']);
+  const restarted = mainController({ ...context.process.env });
+  assert.deepEqual(restarted.controller.getSettings().geminiTranscribeVocabulary, ['CustomDSA']);
+  assert.equal(restarted.controller.saveSettings({ activeSkill: 'devops' }).success, true);
+  assert.deepEqual(restarted.controller.getSettings().geminiTranscribeVocabulary, []);
+  assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: 'bad', geminiTranscribeVocabularySkill: 'missing' }).success, false);
+});
+
+test('legacy custom vocabulary stays on its original skill after switching', () => {
+  const { controller, context } = mainController({ ACTIVE_SKILL: 'ai-engineer', GEMINI_TRANSCRIBE_VOCABULARY: 'MyModel,MyLibrary' });
+  assert.deepEqual(controller.getSettings().geminiTranscribeVocabulary, ['MyModel', 'MyLibrary']);
+  assert.equal(controller.saveSettings({ activeSkill: 'analyst' }).success, true);
+  assert.equal(context.process.env.GEMINI_TRANSCRIBE_VOCABULARY_AI_ENGINEER, 'MyModel,MyLibrary');
+  assert.ok(controller.getSettings().geminiTranscribeVocabulary.includes('ARPU'));
+  assert.equal(controller.saveSettings({ activeSkill: 'ai-engineer' }).success, true);
+  assert.deepEqual(controller.getSettings().geminiTranscribeVocabulary, ['MyModel', 'MyLibrary']);
+});
+
+test('disabling a built-in glossary is blocked during capture even without an existing override', () => {
+  const { controller, context } = mainController({ SPEECH_PROVIDER: 'gemini-live' });
+  context.speechService.isRecording = true;
+  assert.equal(controller.saveSettings({ geminiTranscribeVocabulary: '' }).success, false);
+  assert.equal(context.process.env.GEMINI_TRANSCRIBE_VOCABULARY_DSA, undefined);
 });
 
 test('main overlay resize accepts only its own sender and keeps actions within a monitor with negative coordinates', () => {

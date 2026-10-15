@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const catalogue = require('../src/core/skills');
 const { DEFAULTS } = require('../src/core/ai-settings');
+const { getSkillVocabulary, vocabularyEnvKey, parseVocabulary } = require('../src/core/transcription-vocabulary');
 const GeminiLiveTransport = require('../src/services/gemini-live-transport');
 const root = path.resolve(__dirname, '..');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-ui-test-'));
@@ -18,9 +19,19 @@ const settings = { llmProvider: 'openai', openaiKey: 'test-key', openaiModel: DE
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const captureErrors = [];
 let quitRequests = 0;
+const vocabularyEnv = {};
 ipcMain.on('quit-app', () => { quitRequests++; });
-ipcMain.handle('get-settings', () => settings);
-ipcMain.handle('save-settings', (_event, data) => { Object.assign(settings, data); return { success: true }; });
+ipcMain.handle('get-settings', () => ({ ...settings, geminiTranscribeVocabulary: getSkillVocabulary(settings.activeSkill, vocabularyEnv) }));
+ipcMain.handle('save-settings', (event, data) => {
+  if (data.geminiTranscribeVocabulary !== undefined) {
+    const skill = data.geminiTranscribeVocabularySkill ?? data.activeSkill ?? settings.activeSkill;
+    vocabularyEnv[vocabularyEnvKey(skill)] = parseVocabulary(data.geminiTranscribeVocabulary).join(',');
+  }
+  const changedSkill = data.activeSkill && data.activeSkill !== settings.activeSkill;
+  Object.assign(settings, data);
+  if (changedSkill) event.sender.send('skill-changed', { skill: settings.activeSkill });
+  return { success: true };
+});
 ipcMain.on('save-settings', (_event, data) => Object.assign(settings, data));
 ipcMain.handle('get-available-skills', () => catalogue);
 ipcMain.handle('get-window-stats', () => ({ isInteractive: true }));
@@ -91,6 +102,25 @@ app.whenReady().then(async () => {
     await settingsUI.execute(`document.getElementById('geminiTranscribeVocabulary').value = 'KVCache, PyTorch'; document.getElementById('geminiTranscribeVocabulary').dispatchEvent(new Event('change'));`);
     await delay(100);
     assert.equal(settings.geminiTranscribeVocabulary, 'KVCache, PyTorch');
+    assert.match(await settingsUI.execute(`document.getElementById('geminiVocabularyLabel').textContent`), /Backend/);
+    await settingsUI.execute(`document.getElementById('activeSkill').value = 'ai-engineer'; document.getElementById('activeSkill').dispatchEvent(new Event('change'));`);
+    await delay(100);
+    assert.match(await settingsUI.execute(`document.getElementById('geminiTranscribeVocabulary').value`), /KVCache/);
+    assert.doesNotMatch(await settingsUI.execute(`document.getElementById('geminiTranscribeVocabulary').value`), /PyTorch/);
+    assert.match(await settingsUI.execute(`document.getElementById('geminiVocabularyLabel').textContent`), /AI Engineer/);
+    // A blur save can still be in flight when the new skill is selected.
+    await settingsUI.execute(`document.getElementById('geminiTranscribeVocabulary').value = 'MyModel, KVCache'; document.getElementById('geminiTranscribeVocabulary').dispatchEvent(new Event('blur')); document.getElementById('activeSkill').value = 'backend'; document.getElementById('activeSkill').dispatchEvent(new Event('change'));`);
+    await delay(100);
+    assert.equal(vocabularyEnv.GEMINI_TRANSCRIBE_VOCABULARY_AI_ENGINEER, 'MyModel,KVCache');
+    assert.equal(await settingsUI.execute(`document.getElementById('geminiTranscribeVocabulary').value`), 'KVCache, PyTorch');
+    settings.activeSkill = 'devops';
+    settingsUI.window.webContents.send('skill-changed', { skill: 'devops' });
+    await delay(100);
+    assert.equal(await settingsUI.execute(`document.getElementById('activeSkill').value`), 'devops');
+    assert.match(await settingsUI.execute(`document.getElementById('geminiTranscribeVocabulary').value`), /Kubernetes/);
+    await settingsUI.execute(`document.getElementById('activeSkill').value = 'backend'; document.getElementById('activeSkill').dispatchEvent(new Event('change'));`);
+    await delay(100);
+    assert.equal(await settingsUI.execute(`document.getElementById('geminiTranscribeVocabulary').value`), 'KVCache, PyTorch');
     assert.equal(await settingsUI.execute(`document.getElementById('speechProvider').disabled`), false);
     assert.match(await settingsUI.execute(`document.getElementById('speechProvider').selectedOptions[0].textContent`), /Gemini-3.5-Transcribe Live/);
     assert.equal(await settingsUI.execute(`document.getElementById('dialogueLanguageFields').hidden`), false);
@@ -136,6 +166,10 @@ app.whenReady().then(async () => {
     assert.equal(preferences.sandbox, true);
     assert.deepEqual(transportErrors, []);
     transport.close();
+    await delay(100);
+    assert.equal(transport.window, null);
+    assert.equal(transport.closeTimer, null);
+    assert.deepEqual(transportErrors, []);
 
     await settingsUI.execute(`document.getElementById('speechProvider').value = 'gemini-live'; document.getElementById('speechProvider').dispatchEvent(new Event('change'));`);
     await delay(100);

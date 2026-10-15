@@ -1,7 +1,7 @@
 const { EventEmitter } = require('events');
 const { DEFAULTS, isConfiguredKey } = require('../core/ai-settings');
 const { parse: parseTranscribeLanguages } = require('../core/gemini-transcribe-languages');
-const { parseVocabulary } = require('../core/transcription-vocabulary');
+const { parseVocabulary, getSkillVocabulary } = require('../core/transcription-vocabulary');
 const sessions = new Set();
 let responseSequence = 0;
 const endpoint = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -144,7 +144,7 @@ function createTranscription(options = {}) {
     generationConfig: { responseModalities: ['TEXT'] },
     inputAudioTranscription: {
       languageCodes: parseTranscribeLanguages(options.languageCodes ?? process.env.GEMINI_TRANSCRIBE_LANGUAGES ?? DEFAULTS.geminiTranscribeLanguages),
-      customVocabulary: parseVocabulary(options.customVocabulary ?? process.env.GEMINI_TRANSCRIBE_VOCABULARY ?? DEFAULTS.geminiTranscribeVocabulary)
+      customVocabulary: parseVocabulary(options.customVocabulary ?? getSkillVocabulary(process.env.ACTIVE_SKILL || 'dsa'))
     },
     realtimeInputConfig: { automaticActivityDetection: { disabled: !!options.manual } }
   }, options), options);

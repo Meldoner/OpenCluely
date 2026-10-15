@@ -1421,9 +1421,11 @@ class SpeechService extends EventEmitter {
   }
 
   _getGeminiTranscribeVocabulary() {
-    return require('../core/transcription-vocabulary').parseVocabulary(
-      this._getSetting('geminiTranscribeVocabulary') ?? process.env.GEMINI_TRANSCRIBE_VOCABULARY ?? require('../core/ai-settings').DEFAULTS.geminiTranscribeVocabulary
-    );
+    const { parseVocabulary, getSkillVocabulary } = require('../core/transcription-vocabulary');
+    const skill = process.env.ACTIVE_SKILL || 'dsa';
+    return this.runtimeSettings.geminiTranscribeVocabulary !== undefined && this.runtimeSettings.geminiTranscribeVocabularySkill === skill
+      ? parseVocabulary(this.runtimeSettings.geminiTranscribeVocabulary)
+      : getSkillVocabulary(skill, process.env);
   }
 
   shutdown() {
@@ -1436,6 +1438,10 @@ class SpeechService extends EventEmitter {
   updateSettings(settings = {}) {
     const speechKeys = ['speechProvider', 'dialogueLanguages', 'geminiTranscribeLanguages', 'geminiTranscribeVocabulary', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs'];
     let changed = false;
+
+    if (Object.prototype.hasOwnProperty.call(settings, 'geminiTranscribeVocabulary')) {
+      this.runtimeSettings.geminiTranscribeVocabularySkill = settings.geminiTranscribeVocabularySkill ?? process.env.ACTIVE_SKILL ?? 'dsa';
+    }
 
     for (const key of speechKeys) {
       if (Object.prototype.hasOwnProperty.call(settings, key)) {
